@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, de::Error};
 use serde_json::{from_slice, from_str};
 use time::{OffsetDateTime, Duration};
 use std::net::TcpStream;
+use std::thread;
 use std::io::{Read, Write};
 use tungstenite::{WebSocket, client as ws_client, stream::MaybeTlsStream};
 use crate::config::{CmsSettings, PlayerSettings};
@@ -33,7 +34,7 @@ pub fn start(cms: &CmsSettings, settings: &PlayerSettings, privkey: RsaPrivateKe
         log::info!("Using WebSocket XMR at {}", settings.xmr_web_socket_address);
         match WsConnector::new(&channel, &settings.xmr_web_socket_address, &settings.xmr_cms_key) {
             Ok((connector, receiver)) => {
-                std::thread::spawn(move || connector.run());
+                thread::spawn(move || connector.run());
                 return Ok(receiver);
             }
             Err(e) => log::warn!("failed to connect to XMR WebSocket: {:#}, falling back to ZMQ", e),
@@ -43,7 +44,7 @@ pub fn start(cms: &CmsSettings, settings: &PlayerSettings, privkey: RsaPrivateKe
     log::info!("Using ZMQ XMR at {}", settings.xmr_network_address);
     let (connector, receiver) = ZmqConnector::new(&channel, &settings.xmr_network_address, privkey)
         .context("setting up XMR ZMQ connection")?;
-    std::thread::spawn(move || connector.run());
+    thread::spawn(move || connector.run());
     Ok(receiver)
 }
 
@@ -96,6 +97,8 @@ impl WsConnector {
 }
 
 struct ZmqConnector {
+    uri: String,
+    channel: String,
     private_key: RsaPrivateKey,
     sender: Sender<Message>,
     socket: ZmqSubSocket,
@@ -103,22 +106,39 @@ struct ZmqConnector {
 
 impl ZmqConnector {
     fn new(channel: &str, uri: &str, private_key: RsaPrivateKey) -> Result<(Self, Receiver<Message>)> {
-        let mut socket = ZmqSubSocket::connect(uri).context("connecting XMR socket")?;
-        socket.subscribe(channel.as_bytes())?;
-        socket.subscribe(HEARTBEAT.as_bytes())?;
+        let socket = Self::connect(channel, uri)?;
         let (sender, receiver) = unbounded();
 
         Ok((Self {
+            uri: uri.into(),
+            channel: channel.into(),
             private_key,
             sender,
             socket,
         }, receiver))
     }
 
+    fn connect(channel: &str, uri: &str) -> Result<ZmqSubSocket> {
+        let mut socket = ZmqSubSocket::connect(uri).context("connecting XMR socket")?;
+        socket.subscribe(channel.as_bytes())?;
+        socket.subscribe(HEARTBEAT.as_bytes())?;
+        Ok(socket)
+    }
+
     fn run(mut self) {
         loop {
             if let Err(e) = self.process_msg() {
-                log::error!("handling XMR message: {:#}", e);
+                log::error!("handling XMR message: {:#}, reconnecting in 10s", e);
+                thread::sleep(std::time::Duration::from_secs(10));
+                loop {
+                    match Self::connect(&self.channel, &self.uri) {
+                        Ok(socket) => {
+                            self.socket = socket;
+                            break;
+                        }
+                        Err(e) => log::error!("failed to reconnect XMR socket: {:#}", e),
+                    }
+                }
             }
         }
     }
