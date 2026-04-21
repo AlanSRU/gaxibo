@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 - upcoming
+
+- Implement WebSocket XMR protocol.
+- Reimplement ZMTP for ZMQ XMR to avoid relying on non-updated zeromq
+  crate.
+- Fix a few bugs found by the "xibo-players/arexibo" fork, thanks to
+  Pau Aliagas.
+
 ## 0.4.0 - Apr 2026
 
 - Prevent path traversal in embedded webserver.
