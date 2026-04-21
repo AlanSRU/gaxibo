@@ -132,7 +132,7 @@ extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, _
             }
         }
         cpp::CB_STOPSHELL => {
-            let killmode = match arg2 & 0xff {
+            let killmode = match arg1 & 0xff {
                 0 => Kill::No,
                 1 => Kill::Terminate,
                 _ => Kill::Kill,
