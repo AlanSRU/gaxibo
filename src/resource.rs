@@ -358,7 +358,7 @@ impl<W> HashingWriter<W> {
 impl<W> Write for HashingWriter<W> where W: Write {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let len = self.writer.write(buf)?;
-        self.hasher.update(buf);
+        self.hasher.update(&buf[..len]);
         Ok(len)
     }
 
