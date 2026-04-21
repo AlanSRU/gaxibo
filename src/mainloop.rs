@@ -65,6 +65,9 @@ pub struct Handler {
     layouts: Vec<i64>,
     current_layout: i64,
     shell_process: Option<Popen>,
+    /// Outcome of the most recently run player command, None if no command has
+    /// run yet in this lifetime.
+    last_command_success: Option<bool>,
 }
 
 impl Handler {
@@ -123,7 +126,7 @@ impl Handler {
 
             let mut slf = Self { to_gui, from_gui, settings, cache, xmds, xmr, schedule,
                                  layouts, envdir: envdir.into(), current_layout: 0,
-                                 shell_process: None };
+                                 shell_process: None, last_command_success: None };
             slf.update_settings();
             slf.schedule_check();  // only useful in case of cached schedule
             Ok(slf)
@@ -223,6 +226,7 @@ impl Handler {
                     false
                 }
             };
+            self.last_command_success = Some(success);
             let _ = self.xmds.notify_command_success(success);
         } else {
             log::error!("no such player command: {code}");
@@ -309,7 +313,7 @@ impl Handler {
             currentLayoutId: self.current_layout,
             availableSpace: avail,
             totalSpace: total,
-            lastCommandSuccess: false,  // not implemented yet
+            lastCommandSuccess: self.last_command_success.unwrap_or(true),
             deviceName: &self.settings.display_name,
             timeZone: &util::timezone(),
         };
