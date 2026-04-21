@@ -56,7 +56,7 @@ impl Cms {
                 displayName: &self.display_name,
                 clientType: "linux",
                 clientVersion: clap::crate_version!(),
-                clientCode: 0,
+                clientCode: 400,
                 operatingSystem: "linux",
                 macAddress: &self.mac_addr,
                 xmrChannel: &self.channel,
@@ -81,9 +81,16 @@ impl Cms {
                                     });
                 }
             }
+            // only try websocket if the CMS lets us use it
+            let xmr_type: String = tree.def_child("xmrType", "zmq")?;
+            let xmr_web_socket_address = if &xmr_type == "ws" {
+                tree.def_child("xmrWebSocketAddress", "")?
+            } else { String::new() };
 
             Ok(Some(PlayerSettings {
                 xmr_network_address: tree.parse_child("xmrNetworkAddress")?,
+                xmr_web_socket_address,
+                xmr_cms_key: tree.def_child("xmrCmsKey", "")?,
                 log_level: tree.parse_child("logLevel")?,
                 display_name: tree.parse_child("displayName")?,
                 stats_enabled: tree.parse_child::<i32>("statsEnabled")? != 0,

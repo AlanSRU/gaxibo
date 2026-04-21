@@ -17,6 +17,10 @@ pub struct PlayerSettings {
     pub stats_enabled: bool,
     #[serde(default)]
     pub xmr_network_address: String,
+    #[serde(default)]
+    pub xmr_web_socket_address: String,
+    #[serde(default)]
+    pub xmr_cms_key: String,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default)]

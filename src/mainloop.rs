@@ -3,7 +3,7 @@
 
 //! Main collect loop that also processes XMR requests.
 
-use std::{fmt, fs, path::{Path, PathBuf}, thread, time::Duration};
+use std::{fmt, fs, path::{Path, PathBuf}, time::Duration};
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{after, never, select, tick, Receiver, Sender};
 use itertools::Itertools;
@@ -117,8 +117,7 @@ impl Handler {
         // if we got settings, we are registered and authorized
         if let Some(settings) = res {
             // create the XMR manager which sends us updates via channel
-            let (manager, xmr) = xmr::Manager::new(cms, &settings.xmr_network_address, privkey)?;
-            thread::spawn(|| manager.run());
+            let xmr = xmr::start(cms, &settings, privkey)?;
 
             settings.to_file(&setting_file).context("writing player settings")?;
 

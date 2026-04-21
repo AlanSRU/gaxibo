@@ -9,11 +9,12 @@ use byteorder::{BE, ReadBytesExt};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Deserializer, de::Error};
-use serde_json::from_slice;
+use serde_json::{from_slice, from_str};
 use time::{OffsetDateTime, Duration};
 use std::net::TcpStream;
 use std::io::{Read, Write};
-use crate::config::CmsSettings;
+use tungstenite::{WebSocket, client as ws_client, stream::MaybeTlsStream};
+use crate::config::{CmsSettings, PlayerSettings};
 
 /// Possible messages to forward to the collect thread.
 #[derive(Debug)]
@@ -25,21 +26,86 @@ pub enum Message {
     Command(String),
 }
 
-pub struct Manager {
+pub fn start(cms: &CmsSettings, settings: &PlayerSettings, privkey: RsaPrivateKey) -> Result<Receiver<Message>> {
+    let channel = cms.xmr_channel();
+
+    if !settings.xmr_web_socket_address.is_empty() {
+        log::info!("Using WebSocket XMR at {}", settings.xmr_web_socket_address);
+        match WsConnector::new(&channel, &settings.xmr_web_socket_address, &settings.xmr_cms_key) {
+            Ok((connector, receiver)) => {
+                std::thread::spawn(move || connector.run());
+                return Ok(receiver);
+            }
+            Err(e) => log::warn!("failed to connect to XMR WebSocket: {:#}, falling back to ZMQ", e),
+        }
+    }
+
+    log::info!("Using ZMQ XMR at {}", settings.xmr_network_address);
+    let (connector, receiver) = ZmqConnector::new(&channel, &settings.xmr_network_address, privkey)
+        .context("setting up XMR ZMQ connection")?;
+    std::thread::spawn(move || connector.run());
+    Ok(receiver)
+}
+
+const HEARTBEAT: &str = "H";
+
+struct WsConnector {
+    sender: Sender<Message>,
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+}
+
+impl WsConnector {
+    fn new(channel: &str, uri: &str, cms_key: &str) -> Result<(Self, Receiver<Message>)> {
+        let (mut socket, _) = ws_client::connect(uri)
+            .context("connecting XMR WebSocket")?;
+        let init_msg = format!(
+            "{{\"type\":\"init\",\"channel\":\"{}\",\"key\":\"{}\"}}",
+            channel, cms_key);
+        socket.send(tungstenite::Message::text(init_msg))
+              .context("sending XMR WebSocket init message")?;
+        let (sender, receiver) = unbounded();
+        Ok((Self {
+            sender,
+            socket,
+        }, receiver))
+    }
+
+    fn run(mut self) {
+        loop {
+            if let Err(e) = self.process_msg() {
+                log::error!("handling XMR message: {:#}", e);
+            }
+        }
+    }
+
+    fn process_msg(&mut self) -> Result<()> {
+        let msg = self.socket.read()?;
+        if msg.is_text() {
+            if msg.to_text().ok() == Some(HEARTBEAT) {
+                return Ok(());
+            }
+            log::debug!("got XMR WebSocket message: {:?}", msg);
+            if let Ok(json_msg) = from_str::<JsonMessage>(msg.to_text()?) {
+                if let Some(msg) = json_msg.into_msg() {
+                    self.sender.send(msg).unwrap();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct ZmqConnector {
     private_key: RsaPrivateKey,
     sender: Sender<Message>,
     socket: ZmqSubSocket,
 }
 
-const HEARTBEAT: &[u8] = b"H";
-
-impl Manager {
-    pub fn new(settings: &CmsSettings, connect: &str,
-               private_key: RsaPrivateKey) -> Result<(Self, Receiver<Message>)> {
-        let channel = settings.xmr_channel();
-        let mut socket = ZmqSubSocket::connect(connect).context("connecting XMR socket")?;
+impl ZmqConnector {
+    fn new(channel: &str, uri: &str, private_key: RsaPrivateKey) -> Result<(Self, Receiver<Message>)> {
+        let mut socket = ZmqSubSocket::connect(uri).context("connecting XMR socket")?;
         socket.subscribe(channel.as_bytes())?;
-        socket.subscribe(HEARTBEAT)?;
+        socket.subscribe(HEARTBEAT.as_bytes())?;
         let (sender, receiver) = unbounded();
 
         Ok((Self {
@@ -49,7 +115,7 @@ impl Manager {
         }, receiver))
     }
 
-    pub fn run(mut self) {
+    fn run(mut self) {
         loop {
             if let Err(e) = self.process_msg() {
                 log::error!("handling XMR message: {:#}", e);
@@ -64,7 +130,7 @@ impl Manager {
         assert!(more);
         let (content, more) = self.socket.recv_frame()?;
         assert!(!more);
-        if &*channel != HEARTBEAT {
+        if channel != HEARTBEAT.as_bytes() {
             let json_msg = JsonMessage::new(&self.private_key, &key, &content)?;
             log::debug!("got XMR message: {:?}", json_msg);
             if let Some(msg) = json_msg.into_msg() {
