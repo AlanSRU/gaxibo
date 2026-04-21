@@ -125,13 +125,19 @@ impl ZmqConnector {
 
     fn process_msg(&mut self) -> Result<()> {
         let (channel, more) = self.socket.recv_frame()?;
-        assert!(more);
+        if !more {
+            bail!("malformed XMR frame: expected multi-part, channel is terminal");
+        }
         let (key, more) = self.socket.recv_frame()?;
-        assert!(more);
+        if !more {
+            bail!("malformed XMR frame: expected multi-part, key is terminal");
+        }
         let (content, more) = self.socket.recv_frame()?;
-        assert!(!more);
+        if more {
+            bail!("malformed XMR frame: expected 3 parts, content has more");
+        }
         if channel != HEARTBEAT.as_bytes() {
-            let json_msg = JsonMessage::new(&self.private_key, &key, &content)?;
+            let json_msg = JsonMessage::decrypt(&self.private_key, &key, &content)?;
             log::debug!("got XMR message: {:?}", json_msg);
             if let Some(msg) = json_msg.into_msg() {
                 self.sender.send(msg).unwrap();
@@ -158,7 +164,7 @@ struct JsonMessage {
 }
 
 impl JsonMessage {
-    fn new(private_key: &RsaPrivateKey, key: &[u8], content: &[u8]) -> Result<Self> {
+    fn decrypt(private_key: &RsaPrivateKey, key: &[u8], content: &[u8]) -> Result<Self> {
         let enc_key = BASE64.decode(key)?;
         let mut msg = BASE64.decode(content)?;
         let msg_key = decrypt_private_key(&enc_key, private_key)?;
@@ -246,8 +252,9 @@ impl ZmqSubSocket {
             bail!("ZMTP READY command not understood");
         }
 
-        // now we're ready to receive frames
-        stream.set_read_timeout(None)?;
+        // now we're ready to receive frames, heartbeats come in 30s interval so use 40
+        // to detect dead connection
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(40)))?;
         Ok(Self(stream))
     }
 
@@ -308,11 +315,12 @@ cwFD2YnuxuF9szIeWPTmHUl6aXRIByuKNexbHqTeNhY=
 ";
     use rsa::pkcs1::DecodeRsaPrivateKey;
     let privkey = rsa::RsaPrivateKey::from_pkcs1_pem(pem).unwrap();
-    let msg = JsonMessage::new(&privkey,
-                               b"uKgfpneak5Qx5vppLlJZEEcFQ5Y/xrk45ysmnsIVQGvndFR0R86pPRRDPxvqSBgCDb\
-                                 4xInqC8fQLApEzEjULL4QwERycgfHWMY+KSAEDjaS2/3IvSUPa+XYZVZssC/jddIar\
-                                 ZvqHdfylHqm1IiL6Tgaps05BYeyDYynRmngW8NM=",
-                               b"TOwhZC5mz2N0GoQvUDXsXVDfC3A6Ov5I+raxOsBvvhOLgPFlpz2VxWTsvq5TX8JJ/b\
-                                 gCSdfpe5DTA0bEvwXzDst1KtGjK1Nvdg==").unwrap();
+    let msg = JsonMessage::decrypt(
+        &privkey,
+        b"uKgfpneak5Qx5vppLlJZEEcFQ5Y/xrk45ysmnsIVQGvndFR0R86pPRRDPxvqSBgCDb\
+          4xInqC8fQLApEzEjULL4QwERycgfHWMY+KSAEDjaS2/3IvSUPa+XYZVZssC/jddIar\
+          ZvqHdfylHqm1IiL6Tgaps05BYeyDYynRmngW8NM=",
+        b"TOwhZC5mz2N0GoQvUDXsXVDfC3A6Ov5I+raxOsBvvhOLgPFlpz2VxWTsvq5TX8JJ/b\
+          gCSdfpe5DTA0bEvwXzDst1KtGjK1Nvdg==").unwrap();
     assert_eq!(msg.action, "screenShot");
 }
