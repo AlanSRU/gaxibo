@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 - upcoming
+## 0.5.0 - Apr 2026
 
 - Implement WebSocket XMR protocol.
 - Reimplement ZMTP for ZMQ XMR to avoid relying on non-updated zeromq
