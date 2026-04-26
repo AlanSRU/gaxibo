@@ -83,9 +83,9 @@ fn main() {
 }
 
 fn main_inner() -> anyhow::Result<()> {
-    log::info!("Arexibo {} starting up...", clap::crate_version!());
-
     let args = Args::parse();
+
+    log::info!("Arexibo {} starting up...", clap::crate_version!());
 
     if args.debug {
         log::set_max_level(log::LevelFilter::Debug);
