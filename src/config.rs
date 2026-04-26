@@ -3,10 +3,13 @@
 
 //! Definitions for the player configuration.
 
-use std::{collections::HashMap, fs::File, path::Path, time::Duration};
+use std::{collections::HashMap, fs::File, path::Path, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use md5::{Md5, Digest};
 use serde::{Serialize, Deserialize};
+use rustls::client::danger;
+use rustls::crypto::aws_lc_rs;
+use rustls_pki_types::CertificateDer;
 use crate::command::Command;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -80,12 +83,12 @@ impl CmsSettings {
             .context("serializing player settings")
     }
 
+    /// Deterministic XMR channel ID: `MD5(address + key + display_id)`
     pub fn xmr_channel(&self) -> String {
         let to_hash = format!("{}{}{}", self.address, self.key, self.display_id);
         hex::encode(Md5::digest(to_hash))
     }
 
-    /// Deterministic XMR channel ID: `MD5(address + key + display_id)`
     pub fn make_agent(&self, no_verify: bool) -> Result<ureq::Agent> {
         let tls_config = ureq::tls::TlsConfig::builder()
             .disable_verification(no_verify)
@@ -100,6 +103,75 @@ impl CmsSettings {
             .tls_config(tls_config)
             .proxy(proxy)
             .build().into())
+    }
+
+    pub fn make_rustls_client_config(&self, no_verify: bool) -> Result<rustls::ClientConfig> {
+        aws_lc_rs::default_provider().install_default().expect("crypto provider init");
+        let mut root_store = rustls::RootCertStore::empty();
+        if !no_verify {
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        let mut builder = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        if no_verify {
+            builder
+                .dangerous()
+                .set_certificate_verifier(Arc::new(DisabledVerifier));
+        }
+        Ok(builder)
+    }
+}
+
+/// Copied from ureq's rustls impl.
+#[derive(Debug)]
+struct DisabledVerifier;
+
+impl danger::ServerCertVerifier for DisabledVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<danger::ServerCertVerified, rustls::Error> {
+        Ok(danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA1,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ED448,
+        ]
     }
 }
 

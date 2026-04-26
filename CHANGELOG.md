@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1 - upcoming
+
+- Implement `--no-verify` for WebSocket XMR.
+- Reconnect to WebSocket XMR after errors or timeout.
+
 ## 0.5.0 - Apr 2026
 
 - Implement WebSocket XMR protocol.

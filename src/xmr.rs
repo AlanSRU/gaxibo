@@ -3,6 +3,7 @@
 
 //! Receive, decrypt and handle incoming XMR messages from CMS.
 
+use std::{net::TcpStream, sync::Arc, thread, io::{Read, Write}};
 use anyhow::{bail, Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use byteorder::{BE, ReadBytesExt};
@@ -11,11 +12,11 @@ use rsa::RsaPrivateKey;
 use serde::{Deserialize, Deserializer, de::Error};
 use serde_json::{from_slice, from_str};
 use time::{OffsetDateTime, Duration};
-use std::net::TcpStream;
-use std::thread;
-use std::io::{Read, Write};
-use tungstenite::{WebSocket, client as ws_client, stream::MaybeTlsStream};
+use tungstenite::{WebSocket, http::uri::Uri, stream::MaybeTlsStream};
 use crate::config::{CmsSettings, PlayerSettings};
+
+const READ_TMO: std::time::Duration = std::time::Duration::from_secs(40);
+const RECONNECT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Possible messages to forward to the collect thread.
 #[derive(Debug)]
@@ -27,22 +28,29 @@ pub enum Message {
     Command(String),
 }
 
-pub fn start(cms: &CmsSettings, settings: &PlayerSettings, privkey: RsaPrivateKey) -> Result<Receiver<Message>> {
+pub fn start(cms: &CmsSettings, settings: &PlayerSettings, privkey: RsaPrivateKey,
+             no_verify: bool) -> Result<Receiver<Message>> {
     let channel = cms.xmr_channel();
 
     if !settings.xmr_web_socket_address.is_empty() {
         log::info!("Using WebSocket XMR at {}", settings.xmr_web_socket_address);
-        match WsConnector::new(&channel, &settings.xmr_web_socket_address, &settings.xmr_cms_key) {
+        let tls_config = cms.make_rustls_client_config(no_verify)?;
+        match WsConnector::new(&channel, tls_config,
+                               &settings.xmr_web_socket_address,
+                               &settings.xmr_cms_key) {
             Ok((connector, receiver)) => {
                 thread::spawn(move || connector.run());
                 return Ok(receiver);
             }
-            Err(e) => log::warn!("failed to connect to XMR WebSocket: {:#}, falling back to ZMQ", e),
+            Err(e) => log::warn!("failed to connect to XMR WebSocket: {:#}, \
+                                  falling back to ZMQ", e),
         }
     }
 
     log::info!("Using ZMQ XMR at {}", settings.xmr_network_address);
-    let (connector, receiver) = ZmqConnector::new(&channel, &settings.xmr_network_address, privkey)
+    let (connector, receiver) = ZmqConnector::new(&channel,
+                                                  &settings.xmr_network_address,
+                                                  privkey)
         .context("setting up XMR ZMQ connection")?;
     thread::spawn(move || connector.run());
     Ok(receiver)
@@ -51,30 +59,76 @@ pub fn start(cms: &CmsSettings, settings: &PlayerSettings, privkey: RsaPrivateKe
 const HEARTBEAT: &str = "H";
 
 struct WsConnector {
+    uri: Uri,
+    tls_config: Arc<rustls::ClientConfig>,
+    channel: String,
+    cms_key: String,
     sender: Sender<Message>,
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
 }
 
 impl WsConnector {
-    fn new(channel: &str, uri: &str, cms_key: &str) -> Result<(Self, Receiver<Message>)> {
-        let (mut socket, _) = ws_client::connect(uri)
-            .context("connecting XMR WebSocket")?;
-        let init_msg = format!(
-            "{{\"type\":\"init\",\"channel\":\"{}\",\"key\":\"{}\"}}",
-            channel, cms_key);
-        socket.send(tungstenite::Message::text(init_msg))
-              .context("sending XMR WebSocket init message")?;
+    fn new(channel: &str, tls_config: rustls::ClientConfig,
+           uri: &str, cms_key: &str) -> Result<(Self, Receiver<Message>)> {
+        let uri = Uri::try_from(uri).context("parsing XMR WebSocket URI")?;
+        let tls_config = Arc::new(tls_config);
+        let socket = Self::connect(&uri, tls_config.clone(), channel, cms_key)?;
         let (sender, receiver) = unbounded();
         Ok((Self {
+            uri,
+            tls_config,
+            channel: channel.into(),
+            cms_key: cms_key.into(),
             sender,
             socket,
         }, receiver))
     }
 
+    fn connect(uri: &Uri, tls_config: Arc<rustls::ClientConfig>, channel: &str,
+               cms_key: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>> {
+        let addr = uri.authority()
+                      .context("XMR WebSocket URI missing host:port")?.as_str();
+        let socket = TcpStream::connect(addr)
+            .context("connecting XMR WebSocket TCP stream")?;
+        socket.set_read_timeout(Some(READ_TMO))?;
+        let stream = match uri.scheme_str() {
+            Some("ws") => MaybeTlsStream::Plain(socket),
+            Some("wss") => {
+                let connector = rustls::ClientConnection::new(
+                    tls_config,
+                    "localhost".try_into()?
+                ).context("negotiating TLS connection for XMR WebSocket")?;
+                let stream = rustls::StreamOwned::new(connector, socket);
+                MaybeTlsStream::Rustls(stream)
+            }
+            _ => bail!("XMR WebSocket URI must start with ws:// or wss://"),
+        };
+
+        let (mut socket, _) = tungstenite::client::client(uri, stream)
+            .context("handshaking XMR WebSocket")?;
+        let init_msg = format!(
+            "{{\"type\":\"init\",\"channel\":\"{}\",\"key\":\"{}\"}}",
+            channel, cms_key);
+        socket.send(tungstenite::Message::text(init_msg))
+              .context("sending XMR WebSocket init message")?;
+        Ok(socket)
+    }
+
     fn run(mut self) {
         loop {
             if let Err(e) = self.process_msg() {
-                log::error!("handling XMR message: {:#}", e);
+                log::error!("handling XMR message: {:#}, reconnecting in 10s", e);
+                thread::sleep(RECONNECT);
+                loop {
+                    match Self::connect(&self.uri, self.tls_config.clone(),
+                                        &self.channel, &self.cms_key) {
+                        Ok(socket) => {
+                            self.socket = socket;
+                            break;
+                        }
+                        Err(e) => log::error!("failed to reconnect XMR socket: {:#}", e),
+                    }
+                }
             }
         }
     }
@@ -105,7 +159,8 @@ struct ZmqConnector {
 }
 
 impl ZmqConnector {
-    fn new(channel: &str, uri: &str, private_key: RsaPrivateKey) -> Result<(Self, Receiver<Message>)> {
+    fn new(channel: &str, uri: &str, private_key: RsaPrivateKey)
+           -> Result<(Self, Receiver<Message>)> {
         let socket = Self::connect(channel, uri)?;
         let (sender, receiver) = unbounded();
 
@@ -129,7 +184,7 @@ impl ZmqConnector {
         loop {
             if let Err(e) = self.process_msg() {
                 log::error!("handling XMR message: {:#}, reconnecting in 10s", e);
-                thread::sleep(std::time::Duration::from_secs(10));
+                thread::sleep(RECONNECT);
                 loop {
                     match Self::connect(&self.channel, &self.uri) {
                         Ok(socket) => {
@@ -274,7 +329,7 @@ impl ZmqSubSocket {
 
         // now we're ready to receive frames, heartbeats come in 30s interval so use 40
         // to detect dead connection
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(40)))?;
+        stream.set_read_timeout(Some(READ_TMO))?;
         Ok(Self(stream))
     }
 
@@ -302,18 +357,6 @@ impl ZmqSubSocket {
         Ok((result, more))
     }
 }
-
-// #[test]
-// fn test_zmq() {
-//     let mut socket = ZmqSubSocket::connect("tcp://localhost:5555").unwrap();
-//     socket.subscribe(b"test").unwrap();
-//     let first = socket.recv_frame().unwrap();
-//     let second = socket.recv_frame().unwrap();
-//     assert!(first.1);
-//     assert!(!second.1);
-//     assert_eq!(&*first.0, b"test");
-//     assert_eq!(&*second.0, b"content");
-// }
 
 #[test]
 fn test_decrypt() {

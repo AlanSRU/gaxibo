@@ -120,7 +120,7 @@ impl Handler {
         // if we got settings, we are registered and authorized
         if let Some(settings) = res {
             // create the XMR manager which sends us updates via channel
-            let xmr = xmr::start(cms, &settings, privkey)?;
+            let xmr = xmr::start(cms, &settings, privkey, no_verify)?;
 
             settings.to_file(&setting_file).context("writing player settings")?;
 
