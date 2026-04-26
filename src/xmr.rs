@@ -86,9 +86,12 @@ impl WsConnector {
 
     fn connect(uri: &Uri, tls_config: Arc<rustls::ClientConfig>, channel: &str,
                cms_key: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>> {
-        let addr = uri.authority()
-                      .context("XMR WebSocket URI missing host:port")?.as_str();
-        let socket = TcpStream::connect(addr)
+        let host = uri.host()
+                      .context("XMR WebSocket URI missing host")?;
+        let port = uri.port_u16().unwrap_or(
+            if uri.scheme_str() == Some("wss") { 443 } else { 80 }
+        );
+        let socket = TcpStream::connect((host, port))
             .context("connecting XMR WebSocket TCP stream")?;
         socket.set_read_timeout(Some(READ_TMO))?;
         let stream = match uri.scheme_str() {
