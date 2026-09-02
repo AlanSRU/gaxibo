@@ -175,27 +175,59 @@ pub const BRIDGE_SCRIPT: &str = r#"
   // working the way it does today.
   gui.log = function (msg) { post("log", [msg]); };
 
-  // Stop the page fetching the media at all.
+  // Stop the page fetching the media at all, and do it *before* the fetch
+  // starts.
   //
   // The host decodes the clip, so the element only needs to exist as a
-  // placeholder. Left alone, WPE starts downloading the file over the
-  // embedded server -- 228 MB for the stress clip -- and the `load` event
-  // that triggers the layout's own `region_switch` never arrives, so the
-  // layout never starts and nothing at all appears in the log. The src is
-  // kept on a data attribute for the host to read.
-  function neutralise() {
-    var vids = document.querySelectorAll("video");
-    for (var i = 0; i < vids.length; i++) {
-      var v = vids[i];
-      if (v.dataset.gaxiboSrc) continue;
-      var s = v.getAttribute("src") || "";
-      if (s) {
-        v.dataset.gaxiboSrc = s;
-        v.removeAttribute("src");
-      }
-      v.preload = "none";
+  // placeholder. Two things go wrong if it is left alone:
+  //
+  //  - WPE downloads the file itself. For the 228 MB stress clip that
+  //    saturated the loopback server for about a minute, and the bridge POST
+  //    announcing the video queued behind it -- so the clip started roughly
+  //    60 seconds late, every time, with nothing in any log to say why.
+  //  - Removing the `src` attribute afterwards does not abort a media load
+  //    that is already in flight, so cleaning up on DOMContentLoaded is too
+  //    late to help.
+  //
+  // Hence a MutationObserver installed from the document head, before the body
+  // is parsed: each <video> is stripped as it appears, so no fetch is ever
+  // started. The DOMContentLoaded sweep stays as a backstop for anything the
+  // observer misses.
+  function strip(v) {
+    if (!v || v.dataset.gaxiboSrc) return false;
+    var s = v.getAttribute("src") || "";
+    if (s) {
+      v.dataset.gaxiboSrc = s;
+      v.removeAttribute("src");
+      // load() makes the element forget the resource selection it had already
+      // begun, which removeAttribute alone does not.
+      try { v.load(); } catch (e) {}
     }
-    post("log", ["neutralised " + vids.length + " video element(s)"]);
+    v.preload = "none";
+    return true;
+  }
+  try {
+    new MutationObserver(function (recs) {
+      for (var i = 0; i < recs.length; i++) {
+        var added = recs[i].addedNodes;
+        for (var j = 0; j < added.length; j++) {
+          var n = added[j];
+          if (!n.tagName) continue;
+          if (n.tagName === "VIDEO") strip(n);
+          else if (n.querySelectorAll) {
+            var vs = n.querySelectorAll("video");
+            for (var k = 0; k < vs.length; k++) strip(vs[k]);
+          }
+        }
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {
+    post("log", ["MutationObserver unavailable: " + e]);
+  }
+  function neutralise() {
+    var vids = document.querySelectorAll("video"), n = 0;
+    for (var i = 0; i < vids.length; i++) if (strip(vids[i])) n++;
+    post("log", ["swept " + vids.length + " video element(s), " + n + " newly stripped"]);
   }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", neutralise);
@@ -207,6 +239,7 @@ pub const BRIDGE_SCRIPT: &str = r#"
   var origPlay = HTMLVideoElement.prototype.play;
   var origPause = HTMLVideoElement.prototype.pause;
   HTMLVideoElement.prototype.play = function () {
+    post("log", ["play() intercepted for " + this.id]);
     try {
       var r = this.getBoundingClientRect();
       // The host needs a stable name for the file; the page's src is relative
@@ -291,6 +324,11 @@ mod tests {
         assert!(!BRIDGE_SCRIPT.contains("HTMLMediaElement.prototype.play"));
         // and the host must be able to end a clip the page is waiting on
         assert!(BRIDGE_SCRIPT.contains("__gaxiboVideoEnded"));
+        // The observer is what stops WPE fetching the media at all. Stripping
+        // on DOMContentLoaded is too late: the parser has already started the
+        // load, and that delayed the first clip by ~60s.
+        assert!(BRIDGE_SCRIPT.contains("MutationObserver"),
+                "video elements must be stripped before their fetch starts");
     }
 
     #[test]
