@@ -1,3 +1,6 @@
 /target
 /env*
 /gui/build
+
+# macOS Finder droppings.
+.DS_Store
