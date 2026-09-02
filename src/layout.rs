@@ -16,7 +16,7 @@ use crate::util::{ElementExt, percent_decode};
 // - overriding duration from resources
 // - fromDt/toDt
 
-pub const TRANSLATOR_VERSION: u32 = 10;
+pub const TRANSLATOR_VERSION: u32 = 11;
 
 const LAYOUT_CSS: &str = r##"
 body { margin: 0; background-repeat: no-repeat; overflow: hidden; }
@@ -139,6 +139,15 @@ window.arexibo = {
     this.regions[rid].timeoutid = window.setTimeout(() => {
       this.region_switch(rid, -1, false);
     }, duration * 1000);
+  },
+
+  // Called by a video that has reached its own end.  Cancels the backstop
+  // timeout first, so the region advances exactly once.
+  media_ended: function(rid) {
+    let region = this.regions[rid];
+    if (!region) return;
+    window.clearTimeout(region.timeoutid);
+    this.region_switch(rid, -1, false);
   },
 
   region_done: function(rid) {
@@ -412,8 +421,34 @@ impl<'a> Translator<'a> {
                                     height: {h}px;{}{}'></video>",
                          if mute { "muted" } else { "" },
                          object_fit(opts), object_pos(opts))?;
-                add_start = format!("document.getElementById('m{mid}').play();");
-                duration = format!("() => document.getElementById('m{mid}').duration");
+                // Advance when the clip itself ends, not when a sampled
+                // `.duration` says it should.
+                //
+                // `video.duration` is NaN until metadata has loaded, and
+                // region_switch does `media[next][2]() || 1` -- NaN is falsy,
+                // so sampling it too early silently plays the clip for one
+                // second.  Xibo publishes video widgets with duration=0
+                // ("use the media's own length"), so this is the ordinary
+                // case rather than an edge one.
+                //
+                // The timeout stays as a backstop for a clip that never fires
+                // `ended` (truncated or undecodable), using the real length
+                // plus a second of slack where it is known so `ended` always
+                // wins the race.
+                add_start = format!(
+                    "const v{mid} = document.getElementById('m{mid}'); \
+                     v{mid}.onended = () => window.arexibo.media_ended({rid}); \
+                     Promise.resolve(v{mid}.play()).catch(\
+                       e => console.warn('m{mid} play failed: ' + e));");
+                // Drop the handler when the widget is hidden, so a late
+                // `ended` cannot advance a region this widget no longer owns.
+                add_stop = format!(
+                    "const v{mid} = document.getElementById('m{mid}'); \
+                     v{mid}.onended = null; v{mid}.pause();");
+                duration = format!(
+                    "() => {{ const v = document.getElementById('m{mid}'); \
+                     return (v && isFinite(v.duration) && v.duration > 0) \
+                            ? v.duration + 1 : 3600; }}");
             }
             (_, Some("shellcommand")) => {
                 writeln!(self.out, "<div class='media r{rid}' id='m{mid}' \
@@ -466,5 +501,71 @@ fn object_pos(el: &Element) -> &'static str {
         (_, "top") => " object-position: top;",
         (_, "bottom") => " object-position: bottom;",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn translate(name: &str, xlf: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("gaxibo-xl-{}-{name}",
+                                                    std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let xp = dir.join("t.xlf");
+        let hp = dir.join("t.html");
+        fs::write(&xp, xlf).unwrap();
+        let map = HashMap::new();
+        Translator::new(1, &xp, &hp, &map).unwrap().translate().unwrap();
+        let out = fs::read_to_string(&hp).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// The bug this guards: Xibo publishes video with duration="0", upstream
+    /// timed the region by `video.duration`, and region_switch does
+    /// `media[next][2]() || 1` -- so a clip whose metadata had not yet loaded
+    /// played for one second instead of its length.
+    ///
+    /// The fixture must say `render="native"`, matching what the CMS actually
+    /// publishes (verified against a live 4.5.1 CMS).  `render="html"` is a
+    /// different path entirely -- a CMS-generated page in an iframe -- and a
+    /// fixture using it tests nothing about video at all.
+    #[test]
+    fn video_advances_on_ended_not_on_sampled_duration() {
+        let html = translate("vid", r##"<layout width="1920" height="1024" bgcolor="#000000">
+          <region id="13" width="1920" height="1024" left="0" top="0">
+            <media id="5" type="video" render="native" duration="0" useDuration="0">
+              <options><uri>41.mp4</uri><mute>1</mute></options>
+            </media>
+          </region>
+        </layout>"##);
+        assert!(html.contains("window.arexibo.media_ended(13)"),
+                "video must advance from its own ended event");
+        assert!(html.contains("media_ended: function(rid)"),
+                "the page needs the handler that ended calls");
+        // the duration function must never yield NaN or 0, or the `|| 1` in
+        // region_switch reintroduces the one-second cut
+        assert!(html.contains("isFinite(v.duration)") && html.contains("3600"),
+                "duration needs a finite backstop");
+        assert!(!html.contains("() => document.getElementById('m5').duration"),
+                "the bare sampled duration must be gone");
+        // hiding the widget must drop the handler, or a late ended advances a
+        // region this widget no longer owns
+        assert!(html.contains("onended = null"));
+    }
+
+    /// An image keeps taking its duration from the XLF, unchanged.
+    #[test]
+    fn image_duration_still_comes_from_the_xlf() {
+        let html = translate("img", r##"<layout width="1920" height="1024" bgcolor="#000000">
+          <region id="13" width="1920" height="1024" left="0" top="0">
+            <media id="5" type="image" render="native" duration="10" useDuration="0">
+              <options><uri>42.png</uri></options>
+            </media>
+          </region>
+        </layout>"##);
+        assert!(html.contains("() => 10"), "image duration must stay authored");
+        assert!(!html.contains("onended"), "images have no ended event");
     }
 }
