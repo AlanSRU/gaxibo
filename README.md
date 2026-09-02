@@ -34,9 +34,12 @@ Verified on the target hardware before starting (see
   2.3 MB JS bundle, jQuery, moment.js, Handlebars widget templates, iframes and
   webfonts.
 - **Video comes out of the DOM.** `video`/`localvideo` widgets become
-  placeholders; the frames come from a `v4l2slh264dec` branch composited with
-  `compositor`. Not `glvideomixer`, which measured no faster (1.58 against 1.55
-  cores).
+  placeholders; the frames come from a `v4l2slh264dec` branch. The plan here
+  said `compositor` -- measured on the hardware, that drops frames badly
+  (2.4 cores, many drops), because a `compositor`, `input-selector` or
+  `videoconvert` between `v4l2slh264dec` and `waylandsink` copies 1920x1024 at
+  60 fps through system memory. Composition happens in the Wayland compositor
+  instead; see Status.
 - **The Qt bridge is replaced.** `qrc:///qtwebchannel` resolves in nothing but
   Qt. WPE provides `run-javascript` for the host->JS direction already; only
   JS->host needs building, via a script-message handler.
@@ -44,17 +47,63 @@ Verified on the target hardware before starting (see
 
 ## Status
 
-Nothing of the above is built yet. This fork currently contains upstream
-`v0.5.1` (`d47fb25`) plus one scheduling fix.
+**Built, and running on hardware.** `--renderer wpe` selects the GStreamer path
+beside the untouched Qt one, and it is what the LEDPlayer image ships and pins.
+Verified on a Firefly Station P1 Pro against a Xibo 4.5.1 CMS.
 
-### The carried fix
+- **Hardware decode**, through an explicit `qtdemux ! h264parse !
+  v4l2slh264dec ! waylandsink` chain. `decodebin` cannot negotiate with
+  `waylandsink` at all -- the decoder's output is dmabuf and autoplug works
+  from static caps, which do not advertise it.
+- **Video in a region, not only full screen.** Gaxibo owns one `xdg_toplevel`
+  and hands every sink that surface plus a render rectangle, so the page and
+  each clip become subsurfaces of one window. Composition is the Wayland
+  compositor's, on the GPU: measured, wlroots was already importing the
+  decoder's dmabuf and sampling it on the Mali even for a full-screen clip, so
+  there never was a direct-scanout path to protect.
+- **Several clips at once**, keyed by widget id.
+- **HTML renders**, including the CMS's own bundle, and in Xibo 4.5 nearly
+  every complex widget is `renderAs=html` and therefore already handled.
 
-`Schedule::update()` advanced its index past a layout that had played through
-without telling the caller to navigate, which left a display with a single
-scheduled layout permanently ignoring schedule changes — no error, and the CMS
-reporting it as up to date. Diagnosed on hardware against a Xibo 4.5.1 CMS.
+Measured on that board, of 6 cores:
 
-Submitted upstream; carried here until it lands.
+| | total | note |
+|---|---|---|
+| full-screen clip, page paused | **0.27** | the page is not worth drawing under it |
+| 940x500 clip in a region, page live | **0.75** | |
+| two concurrent clips | **0.93** | both ran 60 s in 60 s |
+| one clip plus a marquee | **2.9** | the marquee alone is ~2.2 |
+
+### Not done
+
+- **Screenshots.** The Qt path renders the webview; here it needs a `tee` into
+  `pngenc`. The CMS asks for them.
+- **Sound, of any kind.** The page pipeline takes only `wpevideosrc`'s video
+  pad. Note that Xibo's `audio` and `videoin` widget types have no arm in
+  `layout.rs` at all and report "unsupported media type" in **both** renderers,
+  upstream included -- that is a separate gap from this one.
+- **Tickers are expensive.** A marquee costs ~2.2 cores of WPE page rendering
+  while a clock repainting every second costs nothing, so the page renderer is
+  the limit rather than the VPU or the composite.
+- **Qt is still in the image**, which is most of the ~270 MB the GStreamer
+  path added. Removing it needs every widget type served by this renderer.
+
+### The carried fixes
+
+Two, both upstream-bound and kept here until they land:
+
+- **`Schedule::update()`** advanced its index past a layout that had played
+  through without telling the caller to navigate, which left a display with a
+  single scheduled layout permanently ignoring schedule changes — no error, and
+  the CMS reporting it as up to date. Submitted upstream.
+- **A video region ended on a sampled duration** rather than on the clip
+  ending. `video.duration` is NaN until metadata loads and the region switch
+  treats NaN as falsy, so a clip could silently play for one second; Xibo
+  publishes video widgets with `duration=0` ("use the media's own length"), so
+  this is the ordinary case rather than an edge one. Drafted, held until it had
+  longer on hardware -- which it now has.
+
+Both diagnosed on hardware against a Xibo 4.5.1 CMS.
 
 ## Relationship to upstream
 
@@ -82,7 +131,8 @@ To make that practical:
   without the rest.
 
 Currently upstream: [birkenfeld/arexibo#36](https://github.com/birkenfeld/arexibo/pull/36),
-the scheduling fix described above.
+the scheduling fix described above. The video-duration fix is drafted against
+`master` on the PR fork and not yet sent.
 
 ## Licence
 
