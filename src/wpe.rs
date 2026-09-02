@@ -27,6 +27,8 @@
 //!   - audio.  `wpevideosrc` exposes audio pads and Arexibo has an `audio`
 //!     widget type; nothing routes them.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -44,6 +46,18 @@ use crate::resource::LayoutId;
 /// The splash layout, served built-in by the embedded webserver.
 const SPLASH: &str = "0.xlf.html";
 
+/// Frame rate asked of WPE for the page layer.
+///
+/// Not 60. A signage page is static almost all of the time, and 1920x1080
+/// BGRA at 60fps is about 500 MB/s of memory writes for frames that are
+/// identical -- on RK3399 that bandwidth is contended with the VPU and the
+/// display controller, and it showed up as waylandsink dropping video buffers
+/// while the CPU sat at 0.86 of 6 cores. Compute was never the limit.
+///
+/// 15 is enough for the animation a Xibo layout actually does (a ticker
+/// scrolling, a fade) and a quarter of the bandwidth.
+const PAGE_FPS: i32 = 15;
+
 /// Builds the pipeline.
 ///
 /// `wpevideosrc` is asked for plain `video/x-raw` rather than GLMemory: the
@@ -56,7 +70,8 @@ const SPLASH: &str = "0.xlf.html";
 /// which is exactly the output contract.  Scaling anything here would break
 /// 1:1 mapping on an LED wall, which is the fault this whole pipeline exists
 /// to avoid.
-fn build(base_uri: &str, width: i32, height: i32) -> Result<(gst::Pipeline, gst::Element)> {
+fn build(base_uri: &str, width: i32, height: i32)
+    -> Result<(gst::Pipeline, gst::Element, gst::Element)> {
     // No `fullscreen=true` on the sink.  Setting it at construction asserts
     // `gst_wl_window_ensure_fullscreen: assertion 'self' failed` because the
     // Wayland window does not exist yet, and the sink then never consumes past
@@ -66,12 +81,34 @@ fn build(base_uri: &str, width: i32, height: i32) -> Result<(gst::Pipeline, gst:
     //
     // A queue decouples WPE's render thread from the sink, so a slow present
     // cannot stall page rendering.
+    // An input-selector, not a compositor.
+    //
+    // Blending was the whole problem. Measured on the player: hardware video
+    // straight to waylandsink costs **0.43 cores and drops nothing** and is
+    // smooth, while the same clip blended with a full-screen WPE layer through
+    // `compositor` cost 2.4 cores and the sink reported "a lot of buffers are
+    // being dropped ... this computer is too slow" -- visibly worse than the
+    // software decode it was meant to replace.
+    //
+    // A full-screen video covers the page completely, so there is nothing to
+    // blend: switching the sink's input is equivalent on screen and costs
+    // almost nothing. videoconvert stays because WPE hands over BGRA while the
+    // decoder hands over NV12, which waylandsink takes natively -- so it is
+    // passthrough for the video and only converts the page.
+    //
+    // `sync-streams=false` matters. By default input-selector synchronises the
+    // *inactive* streams to the running time of the active one. wpevideosrc is
+    // live and never stops producing, so with the file branch active the
+    // selector was reconciling a live stream against a non-live one and the
+    // sink dropped the file's buffers as too late -- at 0.71 of 6 cores, so
+    // never a throughput problem. Nothing needs the inactive stream's timing:
+    // it is not on screen.
     let desc = format!(
-        "wpevideosrc name=src location={base_uri}{SPLASH} \
-         ! video/x-raw,width={width},height={height},framerate=60/1 \
-         ! queue max-size-buffers=3 leaky=downstream \
-         ! videoconvert \
-         ! waylandsink name=sink"
+        "input-selector name=sel sync-streams=false \
+         ! videoconvert ! queue max-size-buffers=3 ! waylandsink name=sink \
+         wpevideosrc name=src location={base_uri}{SPLASH} \
+         ! video/x-raw,width={width},height={height},framerate={PAGE_FPS}/1 \
+         ! queue max-size-buffers=3 leaky=downstream ! sel.sink_0"
     );
     log::debug!("pipeline: {desc}");
     let pipeline = gst::parse::launch(&desc)
@@ -81,7 +118,10 @@ fn build(base_uri: &str, width: i32, height: i32) -> Result<(gst::Pipeline, gst:
     let src = pipeline
         .by_name("src")
         .ok_or_else(|| anyhow!("pipeline has no element named 'src'"))?;
-    Ok((pipeline, src))
+    let sel = pipeline
+        .by_name("sel")
+        .ok_or_else(|| anyhow!("pipeline has no element named 'sel'"))?;
+    Ok((pipeline, src, sel))
 }
 
 /// Points the WebView at a layout.
@@ -105,6 +145,219 @@ fn run_js(src: &gst::Element, script: &str) {
     src.emit_by_name::<()>("run-javascript", &[&script.to_string()]);
 }
 
+/// A video widget currently being decoded outside the page.
+struct Active {
+    bin: gst::Element,
+    pad: gst::Pad,
+}
+
+/// Does this widget cover the whole *layout*?
+///
+/// Only such a video can take the switching path, because switching replaces
+/// the page rather than compositing over it.  Every layout Pixelmabob
+/// publishes is exactly this shape: one region at 0,0 covering the canvas.
+///
+/// Compared against the layout, not the surface.  A 1920x1024 canvas on a
+/// 1920x1080 screen is the normal case on the bench, and comparing against the
+/// screen rejected it -- the video is still the entire content of the layout.
+/// waylandsink keeps `force-aspect-ratio` on by default, so a 1920x1024 frame
+/// on a 1920x1080 output is centred **unscaled** with black bars, which is the
+/// output contract rather than a compromise: content in a rectangle, pure black
+/// around it.
+fn covers_layout(x: i32, y: i32, w: i32, h: i32, lw: i32, lh: i32) -> bool {
+    x <= 0 && y <= 0 && w >= lw && h >= lh
+}
+
+/// Starts decoding a clip and composites it over the page.
+///
+/// `decodebin` rather than an explicit `v4l2slh264dec`: the hardware decoder
+/// already outranks the software one (257 against 256, verified on the
+/// shipping package set), so autoplug picks the VPU for H.264 by itself and
+/// still handles a codec the VPU cannot do. Naming the element explicitly
+/// would turn an unsupported codec into a hard failure.
+///
+/// Nothing scales: no videoscale, and the sink is handed the clip at its
+/// native size.  Resampling is the one thing this whole pipeline exists to
+/// avoid on an LED wall, so a clip whose size does not match the surface is
+/// better wrong-sized and sharp than fitted and soft.
+fn add_video(
+    pipeline: &gst::Pipeline,
+    sel: &gst::Element,
+    src: &gst::Element,
+    res_dir: &Path,
+    mid: &str,
+    uri: &str,
+) -> Result<Active> {
+    // The page reports a basename, and the file lives in the resource cache.
+    // Reject anything with a path separator rather than trusting the page:
+    // the shim is ours, but the page it runs in renders CMS-authored content.
+    if uri.contains('/') || uri.contains('\\') || uri.contains("..") || uri.is_empty() {
+        return Err(anyhow!("refusing suspicious video uri {uri:?}"));
+    }
+    let path: PathBuf = res_dir.join(uri);
+    if !path.is_file() {
+        return Err(anyhow!("video {} is not in the resource cache", path.display()));
+    }
+
+    // Built element by element rather than with parse, because the audio
+    // stream has to be dealt with explicitly.
+    //
+    // The obvious shortcut -- `decodebin caps=video/x-raw
+    // expose-all-streams=false` -- is wrong: it stops decodebin finding a
+    // decoder at all, failing with "Missing decoder: H.264 (High Profile)" on
+    // a clip that plain decodebin handles. Verified both ways on the hardware.
+    //
+    // So decodebin stays unconstrained, and `pad-added` routes the video to
+    // the converter and terminates everything else in a fakesink. Without
+    // that, the unlinked audio pad stalls the demuxer with
+    // "streaming stopped, reason not-linked (-1)" and the clip never plays.
+    // The host cannot route audio yet, so it is discarded: the clip plays
+    // silently rather than not at all.
+    let bin = gst::Bin::with_name(&format!("video-{mid}"));
+    let filesrc = gst::ElementFactory::make("filesrc")
+        .property("location", path.to_str().ok_or_else(|| anyhow!("non-UTF8 path"))?)
+        .build()
+        .context("creating filesrc")?;
+    let dec = gst::ElementFactory::make("decodebin").build().context("creating decodebin")?;
+    let conv = gst::ElementFactory::make("videoconvert").build().context("creating videoconvert")?;
+    let q = gst::ElementFactory::make("queue")
+        .property("max-size-buffers", 3u32)
+        .build()
+        .context("creating queue")?;
+    bin.add_many([&filesrc, &dec, &conv, &q]).context("assembling the video branch")?;
+    filesrc.link(&dec).context("linking filesrc to decodebin")?;
+    conv.link(&q).context("linking videoconvert to queue")?;
+
+    {
+        let conv = conv.clone();
+        let bin_weak = bin.downgrade();
+        let mid_for_log = mid.to_string();
+        dec.connect_pad_added(move |_, pad| {
+            let name = pad
+                .current_caps()
+                .or_else(|| Some(pad.query_caps(None)))
+                .and_then(|c| c.structure(0).map(|st| st.name().to_string()))
+                .unwrap_or_default();
+            if name.starts_with("video/") {
+                if let Some(sink) = conv.static_pad("sink") {
+                    if let Err(e) = pad.link(&sink) {
+                        log::warn!("video {mid_for_log}: could not link video pad: {e}");
+                    }
+                }
+            } else {
+                log::debug!("video {mid_for_log}: discarding a {name} stream");
+                if let Some(bin) = bin_weak.upgrade() {
+                    match gst::ElementFactory::make("fakesink")
+                        .property("async", false)
+                        .property("sync", false)
+                        .build()
+                    {
+                        Ok(fs) => {
+                            let _ = bin.add(&fs);
+                            let _ = fs.sync_state_with_parent();
+                            if let Some(sp) = fs.static_pad("sink") {
+                                let _ = pad.link(&sp);
+                            }
+                        }
+                        Err(e) => log::warn!("video {mid_for_log}: no fakesink: {e}"),
+                    }
+                }
+            }
+        });
+    }
+
+    // Ghost the queue's output so the bin can be linked to the compositor.
+    let qsrc = q.static_pad("src").ok_or_else(|| anyhow!("queue has no src pad"))?;
+    let ghost = gst::GhostPad::with_target(&qsrc).context("ghosting the branch output")?;
+    bin.add_pad(&ghost).context("adding the ghost pad")?;
+    let bin = bin.upcast::<gst::Element>();
+
+    pipeline.add(&bin).context("adding the video branch")?;
+
+    let pad = sel
+        .request_pad_simple("sink_%u")
+        .ok_or_else(|| anyhow!("input-selector refused a new pad"))?;
+
+    let srcpad = bin
+        .static_pad("src")
+        .ok_or_else(|| anyhow!("video branch has no src pad"))?;
+
+    // Tell the page when the clip ends, so its own sequencing advances exactly
+    // as it would have done had the page decoded the video itself.  The EOS is
+    // dropped rather than forwarded: an EOS'd compositor pad would freeze the
+    // clip's last frame on screen, and the page tears the branch down for us
+    // by calling pause() on the way out of the widget.
+    let js_src = src.clone();
+    let mid_owned = mid.to_string();
+    srcpad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
+            if ev.type_() == gst::EventType::Eos {
+                log::info!("video {mid_owned} reached its end");
+                run_js(&js_src, &format!("window.__gaxiboVideoEnded({mid_owned:?});"));
+                return gst::PadProbeReturn::Drop;
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+
+    srcpad.link(&pad).context("linking the video branch to the selector")?;
+
+    // Shift the clip's timestamps so they start *now*.
+    //
+    // This is the fix for playback racing, and the symptom was the opposite of
+    // what it looked like: the 60-second clip finished in 17 seconds -- 3.6x
+    // too fast, which is exactly the VPU's decode speed. The sink was not
+    // pacing it at all, and the "a lot of buffers are being dropped" warnings
+    // were the consequence, not the cause. At 0.86 of 6 cores it was never
+    // too slow; it was far too fast.
+    //
+    // Why: the branch's buffers start at PTS 0, and waylandsink renders at
+    // `its own base time + PTS`. The sink sits in the main pipeline, not in
+    // this bin, and the pipeline is live because wpevideosrc is -- so the
+    // sink's base time is from when the *player* started. PTS 0 therefore maps
+    // to minutes ago, every buffer is late, and the sink renders them all
+    // immediately.
+    //
+    // Setting the base time on the bin, which is what I tried first, cannot
+    // work: base time belongs to the element doing the syncing, and that
+    // element is outside the bin.
+    //
+    // A pad offset is the mechanism meant for this -- it shifts timestamps as
+    // they cross the pad, so PTS 0 becomes "now" for everything downstream.
+    let offset = pipeline
+        .current_running_time()
+        .map(|t| t.nseconds() as i64)
+        .unwrap_or(0);
+    srcpad.set_offset(offset);
+    log::debug!("video {mid}: timestamps offset by {offset} ns");
+
+    bin.sync_state_with_parent().context("starting the video branch")?;
+
+    // Show it.  Until this, the page is still on screen.
+    sel.set_property("active-pad", &pad);
+    log::info!("video {mid}: decoding {} (VPU), sink switched to it", path.display());
+    Ok(Active { bin, pad })
+}
+
+/// Tears a clip's branch down.  Order matters: stop the bin before unlinking,
+/// or a buffer in flight can outlive the pad it was going to.
+fn remove_video(pipeline: &gst::Pipeline, sel: &gst::Element, mid: &str, a: Active) {
+    // Put the page back on screen *before* tearing the branch down, or the
+    // sink is left with no input and the last frame freezes.
+    if let Some(page) = sel.static_pad("sink_0") {
+        sel.set_property("active-pad", &page);
+    }
+    let _ = a.bin.set_state(gst::State::Null);
+    if let Some(srcpad) = a.bin.static_pad("src") {
+        let _ = srcpad.unlink(&a.pad);
+    }
+    if let Err(e) = pipeline.remove(&a.bin) {
+        log::warn!("video {mid}: could not remove branch: {e}");
+    }
+    sel.release_request_pad(&a.pad);
+    log::info!("video {mid}: stopped");
+}
+
 pub fn run(
     settings: PlayerSettings,
     _screen: String,
@@ -113,6 +366,7 @@ pub fn run(
     togui: Receiver<ToGui>,
     fromgui: Sender<FromGui>,
     bridge: Receiver<BridgeMsg>,
+    res_dir: PathBuf,
 ) -> Result<()> {
     gst::init().context("initialising GStreamer")?;
 
@@ -123,11 +377,18 @@ pub fn run(
     let width = if settings.size_x > 0 { settings.size_x as i32 } else { 1920 };
     let height = if settings.size_y > 0 { settings.size_y as i32 } else { 1080 };
 
-    let (pipeline, src) = build(&base_uri, width, height)?;
+    let (pipeline, src, sel) = build(&base_uri, width, height)?;
     log::info!("renderer: wpe (GStreamer), surface {width}x{height}");
     log::warn!("renderer: wpe does not implement screenshots or audio yet");
 
     let schedule = Arc::new(Mutex::new(Schedule::<LayoutId>::default()));
+    // Shared because two threads touch it: the bridge thread adds and removes
+    // branches on the page's instruction, and the bus loop removes one whose
+    // decoder has failed.
+    let active: Arc<Mutex<HashMap<String, Active>>> = Arc::new(Mutex::new(HashMap::new()));
+    // The page reports its own size on init, and that -- not the screen -- is
+    // what a video has to cover to qualify for the switching path.
+    let layout_size = Arc::new(Mutex::new((width, height)));
 
     // Messages from the backend: schedule changes, settings, webhooks.
     {
@@ -170,11 +431,19 @@ pub fn run(
         let base = base_uri.clone();
         let schedule = schedule.clone();
         let fromgui = fromgui.clone();
+        let pipeline = pipeline.clone();
+        let sel = sel.clone();
+        let active_branches = active.clone();
+        let layout_size = layout_size.clone();
         std::thread::spawn(move || {
+            let active = active_branches;
             for msg in bridge {
                 match msg {
                     BridgeMsg::LayoutInit { id, width, height } => {
                         log::info!("layout {id} initialized ({width}x{height})");
+                        if width > 0 && height > 0 {
+                            *layout_size.lock() = (width, height);
+                        }
                         // The splash screen is id 0 and is not announced: the
                         // CMS must not be told we are showing a layout that is
                         // not one of its own.
@@ -207,6 +476,46 @@ pub fn run(
                     BridgeMsg::Shell(cmd, with_shell) => {
                         let _ = fromgui.send(FromGui::Shell(cmd, with_shell));
                     }
+                    BridgeMsg::VideoPlay { mid, uri, x, y, w, h, muted: _ } => {
+                        // Switching replaces the page rather than compositing
+                        // over it, so only a video that covers the whole
+                        // surface can take this path.  Blending the two was
+                        // measured and is not viable: 2.4 cores with the sink
+                        // dropping buffers, against 0.43 and smooth for video
+                        // straight to the sink.
+                        let (lw, lh) = *layout_size.lock();
+                        if !covers_layout(x, y, w, h, lw, lh) {
+                            log::warn!("video {mid} is {w}x{h} at +{x}+{y}, which does \
+                                        not cover the {lw}x{lh} layout; leaving it to \
+                                        the page, which cannot use the VPU");
+                            run_js(&src, &format!(
+                                "(function(){{var e=document.getElementById({mid:?});\
+                                  if(e){{e.style.opacity='1';}}}})();"));
+                            continue;
+                        }
+                        // A repeat play for the same widget means the page is
+                        // looping it: tear the old branch down first, or two
+                        // decoders composite over each other.
+                        if let Some(old) = active.lock().remove(&mid) {
+                            remove_video(&pipeline, &sel, &mid, old);
+                        }
+                        match add_video(&pipeline, &sel, &src, &res_dir, &mid, &uri) {
+                            Ok(a) => { active.lock().insert(mid, a); }
+                            Err(e) => {
+                                // Fall back to letting the page try: a hole on
+                                // screen is worse than a software-decoded clip.
+                                log::warn!("video {mid}: {e:#}; leaving it to the page");
+                                run_js(&src, &format!(
+                                    "(function(){{var e=document.getElementById({mid:?});\
+                                      if(e){{e.style.opacity='1';}}}})();"));
+                            }
+                        }
+                    }
+                    BridgeMsg::VideoStop { mid } => {
+                        if let Some(a) = active.lock().remove(&mid) {
+                            remove_video(&pipeline, &sel, &mid, a);
+                        }
+                    }
                     BridgeMsg::StopShell(mode) => {
                         let kill = match mode {
                             0 => Kill::No,
@@ -231,12 +540,26 @@ pub fn run(
         use gst::MessageView;
         match msg.view() {
             MessageView::Error(err) => {
-                log::error!(
-                    "pipeline error from {:?}: {} ({:?})",
-                    err.src().map(|s| s.path_string()),
-                    err.error(),
-                    err.debug()
-                );
+                let from = err.src().map(|s| s.path_string().to_string()).unwrap_or_default();
+                log::error!("pipeline error from {from}: {} ({:?})", err.error(), err.debug());
+                // A clip that will not decode must not take the sign off the
+                // air.  Only the page and the output are fatal; a video branch
+                // is torn down and the layout carries on without it, which is
+                // a hole rather than a black screen and a restart loop.
+                if from.contains("video-") {
+                    let mid = from
+                        .split("video-")
+                        .nth(1)
+                        .and_then(|r| r.split('/').next())
+                        .unwrap_or("")
+                        .to_string();
+                    log::warn!("video {mid}: dropping the branch, layout continues");
+                    if let Some(a) = active.lock().remove(&mid) {
+                        remove_video(&pipeline, &sel, &mid, a);
+                    }
+                    run_js(&src, &format!("window.__gaxiboVideoEnded({mid:?});"));
+                    continue;
+                }
                 break;
             }
             MessageView::StateChanged(sc) => {

@@ -35,6 +35,18 @@ pub enum BridgeMsg {
     Shell(String, bool),
     /// Stop a running shell command.
     StopShell(u8),
+    /// A video widget wants to play.  The renderer decodes it outside the page.
+    VideoPlay {
+        mid: String,
+        uri: String,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        muted: bool,
+    },
+    /// A video widget was hidden or paused.
+    VideoStop { mid: String },
 }
 
 /// The URL prefix the shim posts to.  Kept distinct from any layout filename.
@@ -71,6 +83,17 @@ pub fn parse(path: &str, body: &str) -> Option<BridgeMsg> {
             args.get(1).map(|s| s.trim() == "1" || s.trim() == "true").unwrap_or(false),
         ),
         "stopShell" => BridgeMsg::StopShell(num(0).unwrap_or(0).clamp(0, 2) as u8),
+        // mid, uri, x, y, w, h, muted
+        "videoPlay" => BridgeMsg::VideoPlay {
+            mid: args.first()?.to_string(),
+            uri: args.get(1)?.to_string(),
+            x: num(2).unwrap_or(0) as i32,
+            y: num(3).unwrap_or(0) as i32,
+            w: num(4).unwrap_or(0) as i32,
+            h: num(5).unwrap_or(0) as i32,
+            muted: args.get(6).map(|s| s.trim() == "1").unwrap_or(true),
+        },
+        "videoStop" => BridgeMsg::VideoStop { mid: args.first()?.to_string() },
         _ => return None,
     })
 }
@@ -127,6 +150,66 @@ pub const BRIDGE_SCRIPT: &str = r#"
     }, 0);
   };
   window.arexiboGui = gui;
+
+  // ---- video: decoded by the host, not by the page ----
+  //
+  // QtWebEngine cannot reach the VPU, and neither can WPE's media stack here.
+  // So a video widget's frames come from a GStreamer branch instead, and the
+  // element in the page becomes a hole.
+  //
+  // This intercepts HTMLVideoElement.prototype.play rather than changing what
+  // layout.rs emits, for three reasons: the generated HTML stays identical for
+  // both renderers, the translator's version marker need not move, and the
+  // sequencing logic that decides *when* a widget plays is untouched -- it
+  // still calls play(), and still waits for `ended`.
+  //
+  // Deliberately HTMLVideoElement, not HTMLMediaElement: Arexibo has an audio
+  // widget type, and the host cannot route audio yet, so <audio> must keep
+  // working the way it does today.
+  var origPlay = HTMLVideoElement.prototype.play;
+  var origPause = HTMLVideoElement.prototype.pause;
+  HTMLVideoElement.prototype.play = function () {
+    try {
+      var r = this.getBoundingClientRect();
+      // The host needs a stable name for the file; the page's src is relative
+      // to the embedded server, so the basename is what identifies it.
+      var src = (this.getAttribute("src") || this.currentSrc || "").split("/").pop();
+      // Make the element a hole so the host's frames show through. Opacity
+      // rather than visibility: the sequencing code sets visibility itself,
+      // and fighting it would mean tracking its state.
+      this.style.opacity = "0";
+      post("videoPlay", [this.id, src,
+                         Math.round(r.left), Math.round(r.top),
+                         Math.round(r.width), Math.round(r.height),
+                         this.muted ? 1 : 0]);
+      window.__gaxiboHostVideo = window.__gaxiboHostVideo || {};
+      window.__gaxiboHostVideo[this.id] = true;
+      return Promise.resolve();
+    } catch (e) {
+      console.warn("gaxibo videoPlay failed, falling back to the page: " + e);
+      return origPlay.call(this);
+    }
+  };
+  HTMLVideoElement.prototype.pause = function () {
+    try {
+      if (window.__gaxiboHostVideo && window.__gaxiboHostVideo[this.id]) {
+        delete window.__gaxiboHostVideo[this.id];
+        post("videoStop", [this.id]);
+        return;
+      }
+    } catch (e) {
+      console.warn("gaxibo videoStop failed: " + e);
+    }
+    return origPause.call(this);
+  };
+
+  // Called by the host when its decoder reaches the end of the clip, so the
+  // page's own sequencing (which waits for `ended`) advances exactly as it
+  // would have if the page had decoded the video itself.
+  window.__gaxiboVideoEnded = function (mid) {
+    var el = document.getElementById(mid);
+    if (el) el.dispatchEvent(new Event("ended"));
+  };
 })();
 "#;
 
@@ -149,6 +232,26 @@ mod tests {
         assert_eq!(parse("/arexibo/shell", "ls\n0"),
                    Some(BridgeMsg::Shell("ls".into(), false)));
         assert_eq!(parse("/arexibo/stopShell", "2"), Some(BridgeMsg::StopShell(2)));
+    }
+
+    #[test]
+    fn parses_video_calls_and_intercepts_only_video() {
+        assert_eq!(parse("/arexibo/videoPlay", "m5\n41.mp4\n0\n0\n1920\n1024\n1"),
+                   Some(BridgeMsg::VideoPlay { mid: "m5".into(), uri: "41.mp4".into(),
+                                               x: 0, y: 0, w: 1920, h: 1024, muted: true }));
+        assert_eq!(parse("/arexibo/videoStop", "m5"),
+                   Some(BridgeMsg::VideoStop { mid: "m5".into() }));
+        // an unmuted clip must not be forced silent
+        match parse("/arexibo/videoPlay", "m5\n41.mp4\n0\n0\n16\n9\n0") {
+            Some(BridgeMsg::VideoPlay { muted, .. }) => assert!(!muted),
+            other => panic!("expected VideoPlay, got {other:?}"),
+        }
+        // Arexibo has an audio widget type and the host cannot route audio, so
+        // the shim must leave <audio> to the page.
+        assert!(BRIDGE_SCRIPT.contains("HTMLVideoElement.prototype.play"));
+        assert!(!BRIDGE_SCRIPT.contains("HTMLMediaElement.prototype.play"));
+        // and the host must be able to end a clip the page is waiting on
+        assert!(BRIDGE_SCRIPT.contains("__gaxiboVideoEnded"));
     }
 
     #[test]

@@ -173,7 +173,8 @@ fn main_inner() -> anyhow::Result<()> {
         Renderer::Wpe => {
             wpe::run(settings, args.screen.unwrap_or_default(), args.inspect,
                      args.web_debug, togui_rx, fromgui_tx,
-                     bridge_rx.expect("bridge channel exists for the wpe renderer"))
+                     bridge_rx.expect("bridge channel exists for the wpe renderer"),
+                     args.envdir.join("res"))
         }
     }
 }
