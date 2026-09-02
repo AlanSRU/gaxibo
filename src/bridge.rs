@@ -47,6 +47,12 @@ pub enum BridgeMsg {
     },
     /// A video widget was hidden or paused.
     VideoStop { mid: String },
+    /// A line of diagnostics from the page.
+    ///
+    /// The page runs inside WPE with no console anyone can read, so without
+    /// this a page that silently fails to start is invisible: the first
+    /// symptom is a blank screen and no log at all.
+    Log(String),
 }
 
 /// The URL prefix the shim posts to.  Kept distinct from any layout filename.
@@ -94,6 +100,7 @@ pub fn parse(path: &str, body: &str) -> Option<BridgeMsg> {
             muted: args.get(6).map(|s| s.trim() == "1").unwrap_or(true),
         },
         "videoStop" => BridgeMsg::VideoStop { mid: args.first()?.to_string() },
+        "log" => BridgeMsg::Log(args.join(" ")),
         _ => return None,
     })
 }
@@ -166,6 +173,37 @@ pub const BRIDGE_SCRIPT: &str = r#"
   // Deliberately HTMLVideoElement, not HTMLMediaElement: Arexibo has an audio
   // widget type, and the host cannot route audio yet, so <audio> must keep
   // working the way it does today.
+  gui.log = function (msg) { post("log", [msg]); };
+
+  // Stop the page fetching the media at all.
+  //
+  // The host decodes the clip, so the element only needs to exist as a
+  // placeholder. Left alone, WPE starts downloading the file over the
+  // embedded server -- 228 MB for the stress clip -- and the `load` event
+  // that triggers the layout's own `region_switch` never arrives, so the
+  // layout never starts and nothing at all appears in the log. The src is
+  // kept on a data attribute for the host to read.
+  function neutralise() {
+    var vids = document.querySelectorAll("video");
+    for (var i = 0; i < vids.length; i++) {
+      var v = vids[i];
+      if (v.dataset.gaxiboSrc) continue;
+      var s = v.getAttribute("src") || "";
+      if (s) {
+        v.dataset.gaxiboSrc = s;
+        v.removeAttribute("src");
+      }
+      v.preload = "none";
+    }
+    post("log", ["neutralised " + vids.length + " video element(s)"]);
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", neutralise);
+  } else {
+    neutralise();
+  }
+  window.addEventListener("load", function () { post("log", ["window load fired"]); });
+
   var origPlay = HTMLVideoElement.prototype.play;
   var origPause = HTMLVideoElement.prototype.pause;
   HTMLVideoElement.prototype.play = function () {
@@ -173,7 +211,8 @@ pub const BRIDGE_SCRIPT: &str = r#"
       var r = this.getBoundingClientRect();
       // The host needs a stable name for the file; the page's src is relative
       // to the embedded server, so the basename is what identifies it.
-      var src = (this.getAttribute("src") || this.currentSrc || "").split("/").pop();
+      var src = (this.dataset.gaxiboSrc || this.getAttribute("src") ||
+                 this.currentSrc || "").split("/").pop();
       // Make the element a hole so the host's frames show through. Opacity
       // rather than visibility: the sequencing code sets visibility itself,
       // and fighting it would mean tracking its state.
