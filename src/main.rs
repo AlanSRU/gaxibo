@@ -16,6 +16,7 @@ pub mod command;
 pub mod logger;
 pub mod util;
 pub mod gui;
+pub mod wpe;
 
 use std::path::PathBuf;
 use anyhow::{ensure, Context};
@@ -66,6 +67,20 @@ struct Args {
     /// showing the last cached schedule.
     #[arg(long)]
     allow_offline: bool,
+    /// Which renderer to use.
+    ///
+    /// `qt` renders everything, including video, in QtWebEngine -- which on
+    /// Rockchip cannot reach the hardware video decoder.  `wpe` renders through
+    /// GStreamer so the VPU can be used.  `qt` is the default while the wpe
+    /// path is incomplete: it has no screenshots and no audio yet.
+    #[arg(long, default_value = "qt")]
+    renderer: Renderer,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Renderer {
+    Qt,
+    Wpe,
 }
 
 fn main() {
@@ -131,14 +146,34 @@ fn main_inner() -> anyhow::Result<()> {
     }
 
     // create the interval webserver on the requested port
-    let webserver = server::Server::new(args.envdir.join("res"), 0)
+    let mut webserver = server::Server::new(args.envdir.join("res"), 0)
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();
+
+    // The wpe renderer has no QWebChannel, so the page calls back over HTTP.
+    // The bridge routes are only served when that renderer is selected, so the
+    // Qt path's attack surface is unchanged.
+    let bridge_rx = if args.renderer == Renderer::Wpe {
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        webserver = webserver.with_bridge(tx);
+        Some(rx)
+    } else {
+        None
+    };
     webserver.start_pool();
 
     std::thread::spawn(|| handler.run());
 
-    gui::run(settings, args.screen.unwrap_or_default(), args.inspect,
-             args.web_debug, togui_rx, fromgui_tx);
-    Ok(())
+    match args.renderer {
+        Renderer::Qt => {
+            gui::run(settings, args.screen.unwrap_or_default(), args.inspect,
+                     args.web_debug, togui_rx, fromgui_tx);
+            Ok(())
+        }
+        Renderer::Wpe => {
+            wpe::run(settings, args.screen.unwrap_or_default(), args.inspect,
+                     args.web_debug, togui_rx, fromgui_tx,
+                     bridge_rx.expect("bridge channel exists for the wpe renderer"))
+        }
+    }
 }

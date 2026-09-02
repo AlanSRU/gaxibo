@@ -146,8 +146,12 @@ extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, _
 }
 
 /// Keeps track of scheduled layouts and the currently shown one.
+///
+/// Shared with the WPE renderer in `crate::wpe`, which sequences layouts the
+/// same way.  Reimplementing it there would mean two copies of the logic the
+/// scheduling fix in this file corrects.
 #[derive(Debug, Default)]
-struct Schedule<T> {
+pub(crate) struct Schedule<T> {
     index: Option<usize>,
     layouts: Vec<T>,
     single_done: bool,
@@ -155,7 +159,7 @@ struct Schedule<T> {
 
 impl<T: Eq + Default + Clone> Schedule<T> {
     /// Update the scheduled layouts and return Some(id) if we need to change
-    fn update(&mut self, new: Vec<T>) -> Option<T> {
+    pub(crate) fn update(&mut self, new: Vec<T>) -> Option<T> {
         // determine the currently shown layout
         let cur_t = self.current();
         self.layouts = new;
@@ -195,7 +199,7 @@ impl<T: Eq + Default + Clone> Schedule<T> {
     }
 
     /// Go to the next layout, if more than one is scheduled, and return Some(id)
-    fn next(&mut self) -> Option<T> {
+    pub(crate) fn next(&mut self) -> Option<T> {
         let nlayouts = self.layouts.len();
         // if there is no layout or only one scheduled, no change
         if nlayouts < 2 {
@@ -209,7 +213,7 @@ impl<T: Eq + Default + Clone> Schedule<T> {
     }
 
     /// Go to the previous layout, if more than one is scheduled, and return Some(id)
-    fn prev(&mut self) -> Option<T> {
+    pub(crate) fn prev(&mut self) -> Option<T> {
         let nlayouts = self.layouts.len();
         // if there is no layout or only one scheduled, no change
         if nlayouts < 2 {
@@ -223,12 +227,12 @@ impl<T: Eq + Default + Clone> Schedule<T> {
     }
 
     /// Return current layout.
-    fn current(&self) -> T {
+    pub(crate) fn current(&self) -> T {
         self.index.map(|i| self.layouts[i].clone()).unwrap_or_default()
     }
 
     /// Mark current layout as having run.
-    fn mark_done(&mut self) {
+    pub(crate) fn mark_done(&mut self) {
         self.single_done = true;
     }
 }
