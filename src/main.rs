@@ -6,6 +6,7 @@
 pub mod config;
 pub mod mainloop;
 pub mod server;
+pub mod bridge;
 pub mod resource;
 pub mod schedule;
 pub mod layout;
