@@ -1,102 +1,63 @@
-# Arexibo
+# Gaxibo
 
-<p align="center">
-  <img src="https://github.com/birkenfeld/arexibo/blob/master/assets/logo.png?raw=true" alt="Logo"/>
-</p>
+A fork of [Arexibo](https://github.com/birkenfeld/arexibo) by Georg Brandl, which
+renders **video through GStreamer** so the hardware video decoder is used, rather
+than through QtWebEngine, which cannot reach it.
 
-Arexibo is an unofficial alternate Digital Signage Player for [Xibo](https://xibo.org.uk),
-implemented mostly in Rust but making use of Qt GUI components, for Linux platforms.
+Upstream's README is kept as [README.upstream.md](README.upstream.md).
 
-It is currently still incomplete.  Don't expect more complex features to work
-unless tested.
+## Why
 
+On the Rockchip RK3399 players this is built for, measured on a 1920x1024 60fps
+30 Mbps H.264 clip:
 
-## Installation
+| | CPU | Throughput |
+|---|---|---|
+| Software decode (`avdec_h264`) | 4.88 cores | 1.11x realtime |
+| Hardware decode (`v4l2slh264dec`) | **0.27 cores** | **3.68x realtime** |
 
-Currently, no binary builds are provided.
+Software decode manages only 1.11x realtime, so full-screen HD at 60 fps has no
+headroom. QtWebEngine reaches neither VA-API nor V4L2 on this platform, and there
+is no VA-API driver for Rockchip, so the decoder has to be driven outside the
+browser.
 
-To build from source, you need:
+GStreamer already ranks `v4l2slh264dec` above `avdec_h264` (257 against 256), so
+`decodebin` selects hardware decode with no rank override.
 
-* The [Rust toolchain](https://www.rust-lang.org/), version >= 1.75.  Refer to
-  https://rustup.rs/ for the easiest way to install, if the Linux distribution
-  provided package is too old.
+## Approach
 
-* CMake and a C++ compiler.
+Verified on the target hardware before starting (see
+`LEDPlayer/gaxibo/PLAN.md` for the measurements and method):
 
-* Qt 6 with the QtWebEngine component and its development headers.
+- **HTML keeps working.** `wpevideosrc` (WPE WebKit as a GStreamer source)
+  renders Arexibo's own generated layout HTML correctly, including the CMS's
+  2.3 MB JS bundle, jQuery, moment.js, Handlebars widget templates, iframes and
+  webfonts.
+- **Video comes out of the DOM.** `video`/`localvideo` widgets become
+  placeholders; the frames come from a `v4l2slh264dec` branch composited with
+  `compositor`. Not `glvideomixer`, which measured no faster (1.58 against 1.55
+  cores).
+- **The Qt bridge is replaced.** `qrc:///qtwebchannel` resolves in nothing but
+  Qt. WPE provides `run-javascript` for the host->JS direction already; only
+  JS->host needs building, via a script-message handler.
+- **Qt goes last**, once every widget type is served by the GStreamer path.
 
-* Development headers for `dbus` (>= 1.6), `zeromq` (>= 4.1)
-  as well as `pkg-config`.
+## Status
 
-To build, run:
+Nothing of the above is built yet. This fork currently contains upstream
+`v0.5.1` (`d47fb25`) plus one scheduling fix.
 
-```
-$ cargo build --release
-```
+### The carried fix
 
-The binary is placed in `target/release/arexibo` and can be run from there.
+`Schedule::update()` advanced its index past a layout that had played through
+without telling the caller to navigate, which left a display with a single
+scheduled layout permanently ignoring schedule changes — no error, and the CMS
+reporting it as up to date. Diagnosed on hardware against a Xibo 4.5.1 CMS.
 
-To install, run:
+Submitted upstream; carried here until it lands.
 
-```
-$ cargo install --path . --root /usr
-```
+## Licence
 
-The will install the binary to `/usr/bin/arexibo`.  It requires no other files
-at runtime, except for the system libraries it is linked against.
-
-Builds have been tested with the available dependency library versions on Fedora
-41, RHEL 9 with EPEL and Ubuntu 24.04.  Note that in order to play some media
-like mp4 videos, you will require a `ffmpeg` package that includes some codecs
-that RHEL/Fedora don't include in their packages, e.g. from rpmfusion.org.
-
-For RHEL derived distributions, install `cmake gcc-c++ cargo dbus-devel
-zeromq-devel qt6-qtwebengine-devel`.  For Debian derived, install `cmake g++
-cargo libdbus-1-dev libzmq3-dev qt6-webengine-dev`.
-
-
-## Usage
-
-Create a new directory where Arexibo can store configuration and media files.
-Then, at first start, use the following command line to configure the player:
-
-```
-arexibo --host <https://my.cms/> --key <key> <dir>
-```
-
-Further configuration options are `--display-id` (which is normally
-auto-generated from machine characteristics) and `--proxy` (if needed).
-
-Arexibo will cache the configuration in the directory, so that in the future you
-only need to start with
-
-```
-arexibo <dir>
-```
-
-Log messages are printed to stdout.  The GUI window will only show up once the
-display is authorized.
-
-
-## Standalone setup with X server
-
-The following example systemd service file shows how to to start an X server
-with Arexibo and no DPMS/screensaver:
-
-```
-[Unit]
-Description=Start X with Arexibo player
-After=network-online.target
-Requires=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/xinit /usr/bin/arexibo /home/xibo/env -- :0 vt2 -s 0 -v -dpms
-User=xibo
-Restart=always
-RestartSec=60
-Environment=NO_AT_BRIDGE=1
-
-[Install]
-WantedBy=multi-user.target
-```
+**AGPL-3.0-or-later**, inherited from Arexibo. Upstream copyright and the
+`LICENSE` file are unchanged. This repository is public because the players are
+flashed with modified binaries, which obliges us to offer corresponding source.
