@@ -57,11 +57,21 @@ const SPLASH: &str = "0.xlf.html";
 /// 1:1 mapping on an LED wall, which is the fault this whole pipeline exists
 /// to avoid.
 fn build(base_uri: &str, width: i32, height: i32) -> Result<(gst::Pipeline, gst::Element)> {
+    // No `fullscreen=true` on the sink.  Setting it at construction asserts
+    // `gst_wl_window_ensure_fullscreen: assertion 'self' failed` because the
+    // Wayland window does not exist yet, and the sink then never consumes past
+    // the first buffer -- which shows as WPE's blank white pre-paint frame
+    // frozen on screen, with the web process idling at 0.09 cores.  cage
+    // fullscreens its single client itself, so the property was never needed.
+    //
+    // A queue decouples WPE's render thread from the sink, so a slow present
+    // cannot stall page rendering.
     let desc = format!(
         "wpevideosrc name=src location={base_uri}{SPLASH} \
          ! video/x-raw,width={width},height={height},framerate=60/1 \
+         ! queue max-size-buffers=3 leaky=downstream \
          ! videoconvert \
-         ! waylandsink name=sink fullscreen=true"
+         ! waylandsink name=sink"
     );
     log::debug!("pipeline: {desc}");
     let pipeline = gst::parse::launch(&desc)
@@ -228,6 +238,12 @@ pub fn run(
                     err.debug()
                 );
                 break;
+            }
+            MessageView::StateChanged(sc) => {
+                // Only the pipeline's own transitions, not every element's.
+                if sc.src().map(|s| s == &pipeline).unwrap_or(false) {
+                    log::info!("pipeline state: {:?} -> {:?}", sc.old(), sc.current());
+                }
             }
             MessageView::Warning(w) => {
                 log::warn!("pipeline warning: {} ({:?})", w.error(), w.debug());
