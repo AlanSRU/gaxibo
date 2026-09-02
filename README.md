@@ -56,6 +56,34 @@ reporting it as up to date. Diagnosed on hardware against a Xibo 4.5.1 CMS.
 
 Submitted upstream; carried here until it lands.
 
+## Relationship to upstream
+
+Gaxibo is **not** an official Arexibo release and is not endorsed by its author.
+Please report Gaxibo bugs here rather than to Arexibo — the display layer is
+being replaced, so most misbehaviour here will be ours.
+
+Fixes that are **not** Gaxibo-specific go **upstream first**, and Gaxibo carries
+them only until they land. That is a deliberate policy, not a courtesy: the
+alternative is a fork that silently accumulates fixes the upstream project never
+receives, which is how forks become dead ends.
+
+To make that practical:
+
+- **Two repositories, two jobs.** [`AlanSRU/arexibo`](https://github.com/AlanSRU/arexibo)
+  is a GitHub fork of Arexibo kept solely for opening pull requests upstream.
+  This repository is the divergent project. Keeping them separate means an
+  upstream PR never has Gaxibo's changes dragged into its diff.
+- **History is rooted at upstream.** `d47fb25` is an ancestor of `main`, so
+  commits cherry-pick cleanly in either direction.
+- **`master` tracks upstream untouched**; `main` is Gaxibo. `git fetch upstream`
+  and compare against `master` to see what has moved.
+- **Never mix concerns in a commit.** A general bug fix and a step of the
+  GStreamer work must not share a commit, or the fix cannot be sent upstream
+  without the rest.
+
+Currently upstream: [birkenfeld/arexibo#36](https://github.com/birkenfeld/arexibo/pull/36),
+the scheduling fix described above.
+
 ## Licence
 
 **AGPL-3.0-or-later**, inherited from Arexibo. Upstream copyright and the
