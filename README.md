@@ -130,6 +130,16 @@ To make that practical:
   GStreamer work must not share a commit, or the fix cannot be sent upstream
   without the rest.
 
+### Knowing where the three forks stand
+
+`tools/fork-status.py --fetch` compares this fork, upstream and
+[romoloman/arexibo](https://github.com/romoloman/arexibo), which share the base
+commit `d47fb25`. The capability matrix is **derived from the three trees** on
+every run rather than written down, so it cannot go stale; [FORKS.md](FORKS.md)
+holds the parts that cannot be derived — a verdict per commit, and the gap
+against what the CMS expects of a player. Worth running before fixing anything,
+because the same bug has been found in more than one of these trees.
+
 Currently upstream: [birkenfeld/arexibo#36](https://github.com/birkenfeld/arexibo/pull/36),
 the scheduling fix described above. The video-duration fix is drafted against
 `master` on the PR fork and not yet sent.
