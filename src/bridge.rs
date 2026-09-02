@@ -170,9 +170,11 @@ pub const BRIDGE_SCRIPT: &str = r#"
   // sequencing logic that decides *when* a widget plays is untouched -- it
   // still calls play(), and still waits for `ended`.
   //
-  // Deliberately HTMLVideoElement, not HTMLMediaElement: Arexibo has an audio
-  // widget type, and the host cannot route audio yet, so <audio> must keep
-  // working the way it does today.
+  // Deliberately HTMLVideoElement, not HTMLMediaElement. Not for Xibo's audio
+  // widget type -- layout.rs has no arm for that and reports it unsupported in
+  // both renderers -- but for an <audio> element inside an HTML widget, which
+  // must keep behaving as it does today. It plays in WPE and is then dropped,
+  // because the page pipeline takes only the video pad.
   gui.log = function (msg) { post("log", [msg]); };
 
   // Stop the page fetching the media at all, and do it *before* the fetch

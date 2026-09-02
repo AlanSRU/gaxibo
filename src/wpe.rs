@@ -19,13 +19,28 @@
 //! regression here is one flag away from being ruled out instead of needing a
 //! bisect.
 //!
+//! Video widgets are decoded by the host on the VPU, at whatever size and
+//! position the layout gives them -- see [`crate::wayland`] for how one
+//! toplevel is shared so a clip can sit in a region beside other content.
+//! H.264 in MP4 is what is handled, which is what the CMS publishes for these
+//! walls; anything else is handed back to the page, in the log rather than
+//! silently.
+//!
 //! What is not done yet, and will report itself rather than fail silently:
-//!   - video widgets still render inside WPE, so the VPU is not yet used.
-//!     That is the next step and the whole point; this module is the vehicle.
 //!   - screenshots.  The Qt path renders the webview; here it needs a `tee`
 //!     into `pngenc`.  The CMS asks for them, so this is a real gap.
-//!   - audio.  `wpevideosrc` exposes audio pads and Arexibo has an `audio`
-//!     widget type; nothing routes them.
+//!   - sound, of any kind.  The page pipeline takes only `wpevideosrc`'s video
+//!     pad, so audio inside an HTML widget plays in WPE and is then dropped;
+//!     `qtdemux`'s audio pad is sent to a fakesink for the same reason.  Note
+//!     that Xibo's *audio* widget type is unsupported by `layout.rs` in both
+//!     renderers -- it has no arm in `write_media` and lands on "unsupported
+//!     media type" -- so this is about sound in a page, not that widget.
+//!   - two clips at once.  Pipelines are keyed by widget id so it should work,
+//!     but two 1920x1024 decodes and two composited layers have never been
+//!     run together.
+//!   - tickers and the rest of Step 6.  The page runs at [`PAGE_FPS`], which
+//!     is plenty for a static sign and is the open question for anything that
+//!     scrolls.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -347,6 +362,35 @@ impl Renderer {
             }
         }
     }
+
+    /// Stops every clip, whichever widget it belongs to.
+    ///
+    /// A layout change is what this exists for. The page navigates, and the
+    /// widgets of the layout being left never call `stop()` -- so nothing tells
+    /// the host their clips are done, and keyed by widget id, a clip from the
+    /// old layout is not the one the new layout's `VideoPlay` replaces.
+    ///
+    /// Measured before this existed: at 17:59:54 a layout changed, at 17:59:55
+    /// its own clip started, and the previous layout's clip went on decoding
+    /// until 18:00:31 -- 36 seconds of two videos on the wall, which is how it
+    /// was found, by looking at the screen rather than at the log.
+    ///
+    /// The single-pipeline version this replaced got away without it by
+    /// accident: `stop_video` took *the* pipeline whatever widget was asking,
+    /// so starting any clip stopped any other.
+    fn stop_all_videos(&self) {
+        let taken: Vec<(String, gst::Pipeline)> = {
+            let mut videos = self.videos.lock();
+            videos.drain().collect()
+        };
+        for (mid, vp) in taken {
+            let _ = vp.set_state(gst::State::Null);
+            log::info!("video {mid}: stopped, the layout changed under it");
+        }
+        if let Err(e) = self.page.set_state(gst::State::Playing) {
+            log::warn!("could not resume the page: {e}");
+        }
+    }
 }
 
 pub fn run(
@@ -428,6 +472,9 @@ pub fn run(
                 match msg {
                     BridgeMsg::LayoutInit { id, width, height } => {
                         log::info!("layout {id} initialized ({width}x{height})");
+                        // The page has navigated: nothing the previous layout
+                        // started may still be on screen.
+                        r.stop_all_videos();
                         if width > 0 && height > 0 {
                             *layout_size.lock() = (width, height);
                         }
