@@ -31,6 +31,11 @@ nix = { version = "0.31", features = ["fs", "hostname"] }
 rand = "0.8"
 dbus = "0.9"
 
+# video
+# GStreamer, for the video path that replaces QtWebEngine's decode.  Pinned to
+# a 0.23.x that builds against the trixie GStreamer 1.26 the image ships.
+gstreamer = "0.23"
+
 # crypto
 arc4 = "0.1"
 md-5 = "0.10"
