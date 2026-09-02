@@ -27,13 +27,17 @@
 //!   - audio.  `wpevideosrc` exposes audio pads and Arexibo has an `audio`
 //!     widget type; nothing routes them.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use gstreamer as gst;
+use gst::glib;
 use gst::prelude::*;
+use gstreamer_video as gst_video;
+use gst_video::prelude::*;
 use parking_lot::Mutex;
 
 use crate::bridge::BridgeMsg;
@@ -41,6 +45,7 @@ use crate::config::PlayerSettings;
 use crate::gui::Schedule;
 use crate::mainloop::{FromGui, Kill, ToGui};
 use crate::resource::LayoutId;
+use crate::wayland::Wayland;
 
 /// The splash layout, served built-in by the embedded webserver.
 const SPLASH: &str = "0.xlf.html";
@@ -53,7 +58,7 @@ const SPLASH: &str = "0.xlf.html";
 /// animation a Xibo layout actually does.
 const PAGE_FPS: i32 = 15;
 
-/// Two pipelines, not one.
+/// A pipeline per surface, sharing one toplevel.
 ///
 /// This is the whole architecture and it was arrived at by measurement, after
 /// three wrong turns. On the player, with the VPU decoding:
@@ -71,31 +76,118 @@ const PAGE_FPS: i32 = 15;
 /// actually negotiate it, so there is no format that lets a converter be
 /// cheap. The video simply has to reach the sink untouched.
 ///
-/// So the page and the video get a pipeline each, and only one is PLAYING.
-/// The page is put in **PAUSED**, never READY: measured on the hardware, WPE
-/// keeps running the page's JavaScript at full rate while PAUSED (2.0
-/// ticks/second against 2.0 while PLAYING) and stops dead in READY (0.0). The
-/// page is what calls `play()`, waits for `ended` and advances regions, so
-/// killing its timers would stop the schedule.
+/// That constraint is about compositing **inside the pipeline, on the CPU**.
+/// Compositing outside it costs nothing extra, because -- measured 2026-09-02
+/// -- it was already happening: with a clip playing full-screen the
+/// scanned-out framebuffer is `allocated by = cage`, so wlroots has always
+/// been importing the decoder's dmabuf and sampling it on the Mali. There was
+/// no direct-scanout path to protect. See [`crate::wayland`].
+///
+/// So the page and each clip get a pipeline each, and every sink is pointed at
+/// **one shared toplevel** with a render rectangle. That is what allows a clip
+/// to play in a region beside other content, and several clips at once.
+///
+/// The page still goes to **PAUSED** while a clip *covers the whole layout*,
+/// which is now an optimisation rather than the only way to show video: there
+/// is no point rendering a page nothing can see. It is never put in READY --
+/// measured on the hardware, WPE keeps running the page's JavaScript at full
+/// rate while PAUSED (2.0 ticks/second against 2.0 while PLAYING) and stops
+/// dead in READY (0.0), and the page is what calls `play()`, waits for `ended`
+/// and advances regions, so killing its timers would stop the schedule.
 ///
 /// Confirmed end to end on the panel: page, then a 45-second clip with zero
 /// drop warnings, then the page again.
 struct Renderer {
     page: gst::Pipeline,
     src: gst::Element,
-    video: Mutex<Option<gst::Pipeline>>,
+    /// Keyed by widget id: a layout may play several clips at once.
+    videos: Mutex<HashMap<String, gst::Pipeline>>,
+    wl: Arc<Wayland>,
 }
 
 /// Does this widget cover the whole *layout*?
 ///
-/// Compared against the layout, not the screen. A 1920x1024 canvas on a
-/// 1920x1080 output is the normal case, and comparing against the screen
-/// rejected exactly the case this exists for. `waylandsink` keeps
-/// `force-aspect-ratio` on, so a 1920x1024 frame on a 1920x1080 output is
-/// centred **unscaled** with black bars -- content in a rectangle, black
-/// around it, which is the output contract rather than a compromise.
+/// This used to decide whether a clip could use the VPU **at all**; it now only
+/// decides whether the page is worth rendering underneath it. Compared against
+/// the layout, not the screen: a 1920x1024 canvas on a 1920x1080 output is the
+/// normal case, and comparing against the screen rejected exactly the case this
+/// exists for.
 fn covers_layout(x: i32, y: i32, w: i32, h: i32, lw: i32, lh: i32) -> bool {
     x <= 0 && y <= 0 && w >= lw && h >= lh
+}
+
+/// The `GstContext` that hands a sink our `wl_display`.
+///
+/// It must reach the sink **before** `set_window_handle`, and is set
+/// proactively rather than in answer to a `need-context` message for that
+/// reason. The sink checks: given a foreign surface while holding a display it
+/// opened itself, it raises `RESOURCE, OPEN_READ_WRITE` -- "Application did not
+/// provide a wayland display handle" -- rather than drawing into the wrong
+/// connection. So a mistake here is loud, and that message is the one to look
+/// for if a surface ever fails to appear.
+fn wayland_context(wl: &Wayland) -> gst::Context {
+    let mut context = gst::Context::new("GstWaylandDisplayHandleContextType", true);
+    // The field name and its `G_TYPE_POINTER` type are the ones
+    // `gst_wayland_display_handle_context_get_handle` reads back with
+    // `gst_structure_get (s, "handle", G_TYPE_POINTER, ...)`.
+    context
+        .get_mut()
+        .expect("a fresh context is writable")
+        .structure_mut()
+        .set("handle", DisplayPtr(wl.display_handle()));
+    context
+}
+
+/// A `wl_display*` on its way into a `GstStructure`.
+///
+/// It needs a wrapper for one reason: a structure's setter requires `Send`,
+/// because a structure can cross threads, and a raw pointer is not. Asserting
+/// it for this pointer is sound and is the basis of the whole embedding --
+/// libwayland is thread-safe for one display dispatched through several
+/// queues, which is exactly what GStreamer's sinks and [`crate::wayland`] do.
+/// The bindings cannot express a `G_TYPE_POINTER` field, so this is also where
+/// the value is built by hand.
+struct DisplayPtr(*mut std::ffi::c_void);
+
+unsafe impl Send for DisplayPtr {}
+
+impl From<DisplayPtr> for glib::Value {
+    fn from(ptr: DisplayPtr) -> Self {
+        use glib::translate::ToGlibPtrMut;
+        let mut value = glib::Value::from_type(glib::Type::POINTER);
+        unsafe {
+            glib::gobject_ffi::g_value_set_pointer(value.to_glib_none_mut().0, ptr.0);
+        }
+        value
+    }
+}
+
+/// Points a pipeline's sink at our surface, at the given rectangle.
+///
+/// The rectangle is in layout coordinates, which are the surface's: the layout
+/// is rendered at the top left by the output contract, so no offset is applied.
+///
+/// Order matters. The context has to be set before the state change that
+/// creates the window, and `set_window_handle` before `set_render_rectangle`:
+/// a rectangle set with no window is **discarded with a warning**, which is
+/// how the first attempt at this silently played full-screen.
+fn place_sink(pipeline: &gst::Pipeline, wl: &Wayland, x: i32, y: i32, w: i32, h: i32)
+    -> Result<()>
+{
+    let sink = pipeline
+        .by_name("sink")
+        .ok_or_else(|| anyhow!("pipeline has no element named 'sink'"))?;
+    sink.set_context(&wayland_context(wl));
+    let overlay = sink
+        .dynamic_cast::<gst_video::VideoOverlay>()
+        .map_err(|_| anyhow!("waylandsink is not a GstVideoOverlay"))?;
+    unsafe {
+        overlay.set_window_handle(wl.surface_handle());
+    }
+    overlay
+        .set_render_rectangle(x, y, w, h)
+        .map_err(|e| anyhow!("setting the render rectangle to {w}x{h}+{x}+{y}: {e}"))?;
+    Ok(())
 }
 
 /// Builds the page pipeline.
@@ -234,15 +326,25 @@ fn run_js(src: &gst::Element, script: &str) {
 }
 
 impl Renderer {
-    /// Puts the page back on screen and tears the clip down.
+    /// Tears one clip down, and resumes the page if it was the last.
     fn stop_video(&self, mid: &str) {
-        let taken = self.video.lock().take();
+        let (taken, remaining) = {
+            let mut videos = self.videos.lock();
+            let taken = videos.remove(mid);
+            (taken, videos.len())
+        };
         if let Some(vp) = taken {
             let _ = vp.set_state(gst::State::Null);
             log::info!("video {mid}: stopped");
         }
-        if let Err(e) = self.page.set_state(gst::State::Playing) {
-            log::warn!("could not resume the page: {e}");
+        // Only the covering case pauses the page, but resuming unconditionally
+        // is right: a page already PLAYING is not disturbed by being asked
+        // again, and tracking which clip did the pausing would go wrong the
+        // first time two clips overlapped.
+        if remaining == 0 {
+            if let Err(e) = self.page.set_state(gst::State::Playing) {
+                log::warn!("could not resume the page: {e}");
+            }
         }
     }
 }
@@ -265,11 +367,20 @@ pub fn run(
     let width = if settings.size_x > 0 { settings.size_x as i32 } else { 1920 };
     let height = if settings.size_y > 0 { settings.size_y as i32 } else { 1080 };
 
+    // Ours, not the sinks': one toplevel they all draw into.
+    let wl = Wayland::new(width, height).context("setting up the Wayland surface")?;
+
     let (page, src) = build_page(&base_uri, width, height)?;
+    place_sink(&page, &wl, 0, 0, width, height).context("placing the page's sink")?;
     log::info!("renderer: wpe (GStreamer), page surface {width}x{height}");
     log::warn!("renderer: wpe does not implement screenshots or audio yet");
 
-    let r = Arc::new(Renderer { page: page.clone(), src: src.clone(), video: Mutex::new(None) });
+    let r = Arc::new(Renderer {
+        page: page.clone(),
+        src: src.clone(),
+        videos: Mutex::new(HashMap::new()),
+        wl: wl.clone(),
+    });
     let schedule = Arc::new(Mutex::new(Schedule::<LayoutId>::default()));
     // The page reports its own size on init, and that -- not the screen -- is
     // what a video must cover to qualify for the switching path.
@@ -357,33 +468,45 @@ pub fn run(
                     }
                     BridgeMsg::VideoPlay { mid, uri, x, y, w, h, muted: _ } => {
                         let (lw, lh) = *layout_size.lock();
-                        if !covers_layout(x, y, w, h, lw, lh) {
-                            log::warn!("video {mid} is {w}x{h} at +{x}+{y}, which does not \
-                                        cover the {lw}x{lh} layout; leaving it to the page, \
-                                        which cannot use the VPU");
+                        if w <= 0 || h <= 0 {
+                            log::warn!("video {mid} has no area ({w}x{h}); leaving it to \
+                                        the page");
                             run_js(&r.src, &format!(
                                 "(function(){{var e=document.getElementById({mid:?});\
                                   if(e){{e.style.opacity='1';}}}})();"));
                             continue;
                         }
+                        let covers = covers_layout(x, y, w, h, lw, lh);
                         // A repeat play for the same widget means the page is
                         // looping it; drop the old pipeline first.
                         r.stop_video(&mid);
                         match build_video(&res_dir, &mid, &uri) {
                             Ok(vp) => {
-                                // Page down before video up, so only one
-                                // surface is ever asking to be shown.
-                                if let Err(e) = r.page.set_state(gst::State::Paused) {
-                                    log::warn!("could not pause the page: {e}");
+                                if let Err(e) = place_sink(&vp, &r.wl, x, y, w, h) {
+                                    log::warn!("video {mid}: {e:#}; leaving it to the page");
+                                    run_js(&r.src, &format!(
+                                        "(function(){{var e=document.getElementById({mid:?});\
+                                          if(e){{e.style.opacity='1';}}}})();"));
+                                    continue;
+                                }
+                                // Nothing of the page would be visible under a
+                                // clip that covers the layout, so stop paying
+                                // to render it. Anything smaller leaves the
+                                // page up: that is the point of this path.
+                                if covers {
+                                    if let Err(e) = r.page.set_state(gst::State::Paused) {
+                                        log::warn!("could not pause the page: {e}");
+                                    }
                                 }
                                 if let Err(e) = vp.set_state(gst::State::Playing) {
                                     log::warn!("video {mid}: will not start: {e}");
                                     r.stop_video(&mid);
                                     continue;
                                 }
-                                log::info!("video {mid}: playing {uri} on the VPU, \
-                                            page paused");
-                                *r.video.lock() = Some(vp.clone());
+                                log::info!("video {mid}: playing {uri} on the VPU at \
+                                            {w}x{h}+{x}+{y}{}", if covers {
+                                                ", page paused" } else { "" });
+                                r.videos.lock().insert(mid.clone(), vp.clone());
 
                                 // Watch this clip's own bus. On its end, tell
                                 // the page so its sequencing advances exactly
@@ -417,9 +540,9 @@ pub fn run(
                                     // current one; a newer play may have
                                     // replaced it while we were waiting.
                                     let still_ours = r2
-                                        .video
+                                        .videos
                                         .lock()
-                                        .as_ref()
+                                        .get(&mid2)
                                         .map(|p| p == &vp)
                                         .unwrap_or(false);
                                     if still_ours {

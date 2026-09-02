@@ -35,6 +35,23 @@ dbus = "0.9"
 # GStreamer, for the video path that replaces QtWebEngine's decode.  Pinned to
 # a 0.23.x that builds against the trixie GStreamer 1.26 the image ships.
 gstreamer = "0.23"
+# For GstVideoOverlay: set_window_handle and set_render_rectangle are what put
+# a clip in a region rather than only full-screen.
+gstreamer-video = "0.23"
+
+# wayland
+# One toplevel shared by every sink, so the page and a clip can be on screen
+# together.  wayland-client must use the *system* backend, sharing
+# libwayland-client with GStreamer: with the pure-Rust backend the pointer from
+# ObjectId::as_ptr() is not a wl_surface* the sink's C code can use.
+#
+# Upper bound for the same reason clap and time carry one: the image builds with
+# Debian trixie's cargo, which is 1.85 and cannot be changed by a
+# rust-toolchain pin because there is no rustup in the builder.
+# wayland-protocols 0.32.13 raised its MSRV to 1.86 and fails to resolve there.
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "<=0.32.12", features = ["client"] }
 
 # crypto
 arc4 = "0.1"

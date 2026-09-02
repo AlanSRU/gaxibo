@@ -16,6 +16,7 @@ pub mod command;
 pub mod logger;
 pub mod util;
 pub mod gui;
+pub mod wayland;
 pub mod wpe;
 
 use std::path::PathBuf;
