@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/gaxibo-dark.svg">
+  <img src="assets/gaxibo.svg" alt="Gaxibo" width="88" height="88">
+</picture>
+
 # Gaxibo
 
 A fork of [Arexibo](https://github.com/birkenfeld/arexibo) by Georg Brandl, which
@@ -143,6 +148,33 @@ because the same bug has been found in more than one of these trees.
 Currently upstream: [birkenfeld/arexibo#36](https://github.com/birkenfeld/arexibo/pull/36),
 the scheduling fix described above. The video-duration fix is drafted against
 `master` on the PR fork and not yet sent.
+
+## The mark
+
+A gazebo, because the name is one letter away from one — and because upstream's
+arc reads just as well as a canopy as it does a dish, so the joke and the
+lineage are the same move. Put two posts under that arc and a lit panel between
+them and the receiver becomes a pavilion with a sign in it, which is what this
+fork actually does: decode on the video unit, put pixels on a wall. The amber
+is deliberate too — upstream's azure is a receiving colour on a receiving mark,
+and hue distance matters when the README has to say in words that this fork is
+not endorsed by the project it came from.
+
+| File | For |
+|---|---|
+| `assets/gaxibo.svg` | light grounds — the README default |
+| `assets/gaxibo-dark.svg` | dark grounds |
+| `assets/gaxibo-mono.svg` | one colour, `currentColor`, for inlining and the console |
+
+Two cuts rather than one file with a `prefers-color-scheme` query inside it.
+That query does work in an `<img>`, but it follows the reader's **system**
+theme rather than the background the mark is sitting on, so a single file put
+pale ink on a white README whenever the reader's OS was dark. Verified by
+rendering it both ways before choosing.
+
+Upstream's own `assets/logo.svg` and `arexibo.png` are left exactly as they
+are, and `arexibo.desktop` still points at `Icon=arexibo`: the binary is still
+called `arexibo`, so renaming the icon alone would only break the lookup.
 
 ## Licence
 

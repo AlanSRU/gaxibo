@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-labelledby="t d">
+  <title id="t">Gaxibo</title>
+  <desc id="d">A gazebo: a curved canopy on two posts, with a lit sign panel beneath it.</desc>
+  <!--
+    The canopy is upstream Arexibo's arc read as a roof rather than a dish: the
+    same shape doing the opposite job, which is the relationship between the
+    two projects. The lit panel is what this fork adds, video decoded on the
+    RK3399's video unit and put on a wall.
+
+    Two cuts rather than one clever file. An SVG in an <img> does honour its own
+    prefers-color-scheme query, but that query follows the viewer's *system*
+    theme and not the background the mark is sitting on, so a single file put
+    pale ink on a white README whenever the reader's OS was dark. Verified by
+    rendering both ways. Pick the cut that matches the ground: this one is for dark grounds; gaxibo.svg is for light.
+  -->
+  <style>
+    .s { fill: none; stroke: #EDEDF0; stroke-linecap: round; }
+    .p { fill: #FF9A3D; }
+  </style>
+  <path class="s" d="M6 27 Q32 4 58 27" stroke-width="6"/>
+  <path class="s" d="M13 29 V54" stroke-width="5"/>
+  <path class="s" d="M51 29 V54" stroke-width="5"/>
+  <path class="s" d="M8 56 H56" stroke-width="5"/>
+  <rect class="p" x="21" y="33" width="22" height="15" rx="2"/>
+</svg>

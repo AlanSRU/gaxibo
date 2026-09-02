@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none" stroke="currentColor" role="img" aria-labelledby="t d">
+  <title id="t">Gaxibo</title>
+  <desc id="d">A gazebo drawn in a single colour: a curved canopy on two posts, with a sign panel beneath it.</desc>
+  <!--
+    One colour, for the framebuffer console and anywhere the mark is inlined
+    and should take the surrounding ink.
+
+    The panel is an outline with a scan line rather than a fill: filled in a
+    single colour it merges with the posts and the base into one mass, and the
+    point of the mark is that there is a screen under the canopy.
+  -->
+  <path d="M6 27 Q32 4 58 27" stroke-width="6" stroke-linecap="round"/>
+  <path d="M13 29 V54" stroke-width="5" stroke-linecap="round"/>
+  <path d="M51 29 V54" stroke-width="5" stroke-linecap="round"/>
+  <path d="M8 56 H56" stroke-width="5" stroke-linecap="round"/>
+  <rect x="22" y="34" width="20" height="13" rx="2" stroke-width="3.5"/>
+  <path d="M27 40.5 H37" stroke-width="3" stroke-linecap="round"/>
+</svg>
