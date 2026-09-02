@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QCursor>
 #include <QMainWindow>
 #include <QScreen>
 #include <QtWebEngineCore/QWebEngineProfile>
@@ -29,6 +30,21 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
 
     QCoreApplication::setOrganizationName("arexibo");
     the_app = new QApplication(fake_argc, fake_argv);
+
+    // A signage player has no pointer, so hide the cursor.
+    //
+    // This has to be done by the client.  Nothing else in the stack can:
+    // cage has no cursor option (its whole set is -d -h -m -s -v), wlroots
+    // draws a cursor whenever libinput reports a pointer and offers no way to
+    // suppress it, and marking the mouse LIBINPUT_IGNORE_DEVICE=1 in udev
+    // leaves the cursor on screen anyway -- all three tested on the hardware.
+    // XCURSOR_SIZE=1 and a nonexistent XCURSOR_THEME did not hide it either.
+    //
+    // setOverrideCursor rather than setCursor on the window: QWebEngineView
+    // puts the page in a child render widget that sets its own cursor for
+    // links and text, which would override a cursor set on the parent.  An
+    // application override outranks all of them.
+    QApplication::setOverrideCursor(Qt::BlankCursor);
 
     auto screens = QApplication::screens();
     QScreen *selected_screen = nullptr;
